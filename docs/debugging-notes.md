@@ -99,18 +99,84 @@ It reproduces on the **smallest possible input** — `B=1, T=16, H=1`, a single
 tile on a single core — and it reproduces every run. That is good news for
 debugging: one tile, one AIC, one AIV pair, fully deterministic.
 
-### Ruled out
+### Ruled out — and this narrows it a lot
 
-- **The cross-core handshake pattern.** `scratchpad/sync_probe.cpp` runs
-  kernel1's exact two-round AIC/AIV handshake with all compute removed and
-  completes (`sync result: 0`). Caveat: its 8 `uint32` markers per core share
-  one 32-byte cacheline so AIC/AIV clobber each other's — give them separate
-  cachelines before trusting per-stage detail.
-- **Both AIV subcores signalling.** I guarded the handshakes on `subIdx == 0`
-  on the theory that double-setting `elemReady` left unconsumed counts. It did
-  not change the hang. The guard is still in the tree and is probably correct
-  on its own merits, but it is not the bug.
-- **The B-operand `srcStride`.** See below.
+Bisection result, which redirects everything: **kernel1 hangs with all compute
+removed.** With `FKDA_SKIP_AIV` and `FKDA_SKIP_AIC` both defined (the stage
+gates are in the tree) so each side executes nothing but its handshakes, *and*
+`launch_fwd_recurrence` commented out so only kernel1 launches, a single tile
+still never synchronizes.
+
+So the fault is **not** in the algorithm, the GEMM parameters, the fractal
+strides, or the Neumann iteration. It is in the launch/synchronization
+scaffolding. Everything below follows from that:
+
+- Not the algorithm — there is none left running.
+- Not kernel2 — it is not being launched.
+- Not the B-operand `srcStride` — reverted, no effect either way.
+- Not both AIV subcores signalling — guarding on `subIdx == 0` changed nothing
+  (the guard is still in the tree; it is defensible but not the bug).
+
+### The one difference from the probe that works
+
+`tests/sync_probe.cpp` runs the *same* two-round handshake and completes. The
+differences between it and the real kernel are now the entire suspect list:
+
+| | sync_probe (works) | kernel1 (hangs) |
+|---|---|---|
+| blockDim | 1, 2 and 4 all complete | 1 (`total_tiles * H`) |
+| stream | own `aclrtCreateStream` | torch's `c10_npu::getCurrentNPUStream()` |
+| launched from | plain C++ `main` | pybind module inside torch |
+
+**blockDim is ruled out**: `sync_probe 1`, `sync_probe 2` and `sync_probe 4` all
+report `sync result: 0 (completed)`. A single-block mixed AIC/AIV launch with
+cross-core sync is fine on its own.
+
+**torch's stream is ruled out**: launching on a private `aclrtCreateStream` with
+an explicit `aclrtSynchronizeStream` still hangs (and hangs *inside* `fwd`,
+since the sync is now in the launch function). The patch used for this is
+`scratchpad/patch_stream.py`; the source has been restored.
+
+### The remaining structural difference — start here
+
+`sync_probe`'s kernel class has **no members**. `FwdPrepareKernel` holds a
+`Catlass::Arch::Resource<ArchTag> resource_`, and that member is constructed
+even when every compute path is compiled out — which is exactly the
+configuration that still hangs.
+
+`Resource`'s constructor contains an `AscendC::TPipe` and calls `pipe.Destroy()`
+in its body, with this comment in `catlass/arch/resource.hpp`:
+
+> The initialization of AscendC::Tpipe will insert some synchronization
+> interfaces, which may conflict with the usage by users. Therefore, the
+> "destroy" interface is used for releasing.
+
+So `Resource` and hand-written cross-core sync are documented as potentially
+conflicting, and this kernel uses both. Next experiments, in order:
+
+1. Add a `Catlass::Arch::Resource<ArchTag>` member to `sync_probe`'s class,
+   change nothing else, and rerun. If the probe now hangs, that is the bug,
+   reproduced in 40 lines.
+2. If so, look at how `examples/19_mla/mla_kernel.cpp` orders `Resource`
+   construction against its cross-core flags — it uses both successfully, so
+   the ordering or the flag setup there is the pattern to copy.
+3. Consider whether `resource_` should be constructed inside each
+   `operator()<AIC>` / `operator()<AIV>` body rather than as a class member, so
+   its TPipe lifetime does not span the handshakes.
+
+### Suspects for later, once it runs at all
+
+1. **`Sigmoid`'s `Div` and `ReduceSum`'s work buffer** — both are higher-level
+   vector APIs that may want a reserved tmp buffer, and `Resource<ArchTag>`
+   hands all 192 KB of UB to `ubBuf`, leaving none.
+2. **`ComputeNeumann`'s Fixpipe-to-bf16 chain** — nine dependent
+   MMAD→Fixpipe→GM→L1 round trips with `FIX_MTE2` as the only guard between a
+   Fixpipe and the next load of the slot it just wrote.
+3. **`GemmAt`'s `ifTranspose = true`** on the nZ A operand in kernel2.
+4. The hand-derived stride refactor described above — still worth doing on its
+   own merits, but it is now clear it is not what is hanging.
+
+`msDebug` is available in this CANN install if needed.
 
 ### A wrong turn, recorded so it is not repeated
 

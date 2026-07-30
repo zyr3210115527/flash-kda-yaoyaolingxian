@@ -120,9 +120,11 @@ public:
         // blocks forever. The draft returned early and deadlocked on varlen.
         const bool active = span.valid && (subIdx == 0);
 
+#ifndef FKDA_SKIP_AIV
         if (active) {
             Prepare(params, headIdx, span);
         }
+#endif
         AscendC::PipeBarrier<PIPE_ALL>();
         // Only the subcore that did the work signals. Both subcores signalling
         // sets the flag twice per round against a single AIC wait, and the
@@ -131,9 +133,11 @@ public:
             Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
             Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
         }
+#ifndef FKDA_SKIP_AIV
         if (active) {
             MaskAndBuild(params, headIdx, span);
         }
+#endif
         AscendC::PipeBarrier<PIPE_ALL>();
         if (subIdx == 0) {
             Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
@@ -155,15 +159,19 @@ public:
         ResolveTile(params, tileIdx, span);
 
         Catlass::Arch::CrossCoreWaitFlag(elemReady_);
+#ifndef FKDA_SKIP_AIC
         if (span.valid) {
             ComputeLAndMqk(params, headIdx, span);
         }
+#endif
         Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
 
         Catlass::Arch::CrossCoreWaitFlag(elemReady_);
+#if !defined(FKDA_SKIP_AIC) && !defined(FKDA_SKIP_NEUMANN)
         if (span.valid) {
             ComputeNeumann(params, headIdx, span);
         }
+#endif
         Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
     }
 
