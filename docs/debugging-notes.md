@@ -44,45 +44,65 @@ L/Mqk, AIV mask, AIC Neumann — ordered by the stream instead of by flags. Ever
 inter-phase value already travelled through GM workspace, so this was cheap.
 With all four phase bodies stubbed out, the four launches complete.
 
-**2. With the split in place, the hang is isolated to the cube phases.** Running
-one phase at a time:
+**2. With the split in place, the hang is isolated to one call.** Running one
+phase at a time, then bisecting inside the failing one:
 
-| Phase | Core | Result |
+| What runs | Core | Result |
 |---|---|---|
 | `RunPrepare` — normalize, gate, cumsum, decay, store | AIV | **completes** |
-| `RunLMqk` — `L = k_dec @ k_inv^T`, `Mqk = q_dec @ k_inv^T` | AIC | **hangs** |
 | `RunMask` — tril mask, beta sigmoid, build `(I - L)` | AIV | **completes** |
+| `RunLMqk` — the L / Mqk GEMMs | AIC | **hangs** |
 | `RunNeumann` — the inverse | AIC | **hangs** |
+| `RunLMqk` with both `Gemm128` calls removed, `LoadBt` only | AIC | **hangs** |
+| same, but `LoadBt` doing a plain non-transposed `[16,128]` load | AIC | **hangs** |
+| same, but `Resource` constructed locally rather than as a member | AIC | **hangs** |
+| `aic_only` probe — AIC writes one scalar to GM, no L1 | AIC | **completes** |
 
-Both AIV phases work. Both AIC phases hang. The fault is in the shared cube
-path: `Nd2NzParams` → `LoadData2DParams` → `Mmad` → `FixpipeParamsV220`.
+So the cube itself runs fine from the extension (`aic_only` returns 7), both
+vector phases run correctly, and the failure is **one call**: the `Nd2Nz`
+`DataCopy` from GM into L1. It hangs even in its simplest form — a plain
+non-transposed `[16, 128]` load — so this is not about the transposed
+parameterization.
+
+Not the cause, each tested: `Resource` as member vs local; the transposed
+ColumnMajor view; the two `Gemm128` calls (removed and it still hangs).
 
 ## What to do next
 
-This is the hand-derived stride code, and it should be replaced rather than
-patched — hand-computing fractal strides is the habit that produced the draft
-this rewrite replaced. A malformed `LoadData` descriptor stalling MTE1 forever
-is exactly the symptom.
+Start from the one failing call and nothing else. A standalone AIC kernel in the
+extension that does a single `Nd2Nz` GM→L1 `DataCopy` and then returns is a
+five-minute experiment and either reproduces the hang in isolation or shows the
+surrounding code matters.
 
-Replace the hand-rolled descriptors in `Gemm128`, `Gemm16`, `LoadBt` (kernel1)
-and `Gemm`, `GemmAt`, `LoadNd2Nz` (kernel2) with the catlass tile classes, which
-take layout objects and derive every stride themselves:
+Then compare that call against how catlass actually issues it. `CopyGmToL1`
+(`gemm/tile/atlasa2/copy_gm_to_l1.hpp`) is the reference; note that it derives
+every field from a layout object and that the L1 destination tensor comes from
+a buffer whose size it knows. Two things worth checking specifically:
+
+- Whether the L1 `LocalTensor` obtained via
+  `resource_.l1Buf.GetBufferByByte<BF16>(offset)` is actually valid for a write
+  of this size — the whole 512 KB is handed to `l1Buf`, but the destination
+  extent implied by `dstNzC0Stride` may run past what the descriptor allows.
+- Whether `DataCopy(LocalTensor, GlobalTensor, Nd2NzParams)` is the supported
+  overload here at all, versus going through `CopyGmToL1`.
+
+The durable fix remains replacing the hand-rolled `Nd2NzParams` /
+`LoadData2DParams` / `FixpipeParamsV220` in `Gemm128`, `Gemm16`, `LoadBt`
+(kernel1) and `Gemm`, `GemmAt`, `LoadNd2Nz` (kernel2) with the catlass tile
+classes, which take layouts and derive every stride themselves:
 
 - `Catlass::Gemm::Tile::CopyGmToL1<ArchTag, GemmType<Element, Layout>>`
 - `Catlass::Gemm::Tile::CopyL1ToL0A<...>` / `CopyL1ToL0B<...>`
 - `Catlass::Gemm::Tile::CopyL0CToGm<...>`
 
 Build layouts with `layout::RowMajor(rows, cols)` and
-`layout::zN::MakeLayout<Element>(rows, cols)`. Model the structure on
+`layout::zN::MakeLayout<Element>(rows, cols)`; model on
 `examples/19_mla/mla_kernel.cpp`. This also deletes `utils.hpp`'s
 `ZnBlockOffsetBytes` / `Nd2NzC0Stride` / `Nd2NzNStride`.
 
-Bisect within `RunLMqk` first — it is the simpler of the two cube phases (one
-`LoadBt` plus two `Gemm128` calls), and whatever fixes it very likely fixes
-`RunNeumann` too.
-
-Kernel2 still uses cross-core handshakes and must get the same split treatment
-once kernel1's cube path runs.
+Kernel2 still uses cross-core handshakes and needs the same split treatment once
+kernel1's cube path runs. It is serial across chunks, so the chunk loop probably
+has to move to the host.
 
 ## Diagnostics left in the tree
 
