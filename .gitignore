@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.a
+.DS_Store
+build/
+dist/
+*.egg-info/
+.gitnexus/
+.vscode/
+.idea/
+compile_commands.json
+.clangd

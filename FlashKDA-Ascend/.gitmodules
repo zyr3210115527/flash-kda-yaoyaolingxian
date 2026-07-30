@@ -1,0 +1,3 @@
+[submodule "catlass"]
+	path = catlass
+	url = https://atomgit.com/cann/catlass.git
