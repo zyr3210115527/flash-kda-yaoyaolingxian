@@ -10,6 +10,7 @@ No CUDA dependencies — works on CPU or NPU.
 """
 
 import torch
+import torch_npu  # registers the npu device with torch
 import math
 
 # ============================================================
@@ -224,7 +225,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
                 _out = _out + torch.matmul(Mqk, U)
 
                 # State update: state = state * exp(g_total) + k_restored^T @ u
-                delta_s = torch.mm(k_restored.t(), U, out_dtype=torch.float32)
+                delta_s = torch.mm(k_restored.t().float(), U.float())
 
                 g_total_exp = fp32_ex2_ftz(g_total)
                 g_total_exp = g_total_exp.squeeze(0).unsqueeze(-1)

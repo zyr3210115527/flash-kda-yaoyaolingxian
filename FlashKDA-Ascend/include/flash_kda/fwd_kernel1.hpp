@@ -124,16 +124,21 @@ public:
             Prepare(params, headIdx, span);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
-        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-
-        Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+        // Only the subcore that did the work signals. Both subcores signalling
+        // sets the flag twice per round against a single AIC wait, and the
+        // leftover counts hang teardown after the kernel itself has finished.
+        if (subIdx == 0) {
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
+            Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+        }
         if (active) {
             MaskAndBuild(params, headIdx, span);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
-        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-
-        Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+        if (subIdx == 0) {
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
+            Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+        }
     }
 
     template <>
@@ -490,7 +495,9 @@ private:
 
         AscendC::GlobalTensor<BF16> gmBeta;
         gmBeta.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.beta));
-        const int64_t betaOff = static_cast<int64_t>(headIdx) * params.T_total + span.tokenBase;
+        // beta is [T_total, H]: this chunk's values start at the first token of
+        // the tile and repeat every H elements.
+        const int64_t betaOff = span.tokenBase * params.H + headIdx;
 
         // sigmoid(beta) for all 16 rows at once. Two hardware constraints shape
         // this: the aicore has no scalar exp intrinsic, and the backend rejects
@@ -505,7 +512,12 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>((event_t)3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((event_t)3);
 
-        AscendC::DataCopyExtParams bp{1, static_cast<uint32_t>(span.actualLen * 2), 0, 0, 0};
+        // blockCount rows of one bf16 each, srcStride skipping the other heads.
+        AscendC::DataCopyExtParams bp{
+            static_cast<uint16_t>(span.actualLen),
+            static_cast<uint32_t>(sizeof(BF16)),
+            static_cast<uint32_t>((params.H - 1) * sizeof(BF16)),
+            0, 0};
         AscendC::DataCopyPadExtParams<BF16> bpad{false, 0, 0, static_cast<BF16>(0)};
         AscendC::DataCopyPad(braw, gmBeta[betaOff], bp, bpad);
 
@@ -620,14 +632,25 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
 
-        AscendC::LoadData2DParams ld;
-        ld.startIndex = 0;
-        ld.repeatTimes = (CHUNK / 16) * (D / 16);
-        ld.srcStride = 1;
-        ld.dstGap = 0;
-        ld.ifTranspose = false;
-        AscendC::LoadData(l0A, l1A, ld);
-        AscendC::LoadData(l0B, l1B, ld);
+        // srcStride is layoutSrc.stride(3) / ELE_NUM_PER_FRACTAL (256 for bf16),
+        // so it differs between the two operands and they cannot share params:
+        //   A [16,128]  zN: stride(3) = 256  -> 1
+        //   B [128,16]  nZ: stride(3) = 2048 -> 8
+        AscendC::LoadData2DParams lda;
+        lda.startIndex = 0;
+        lda.repeatTimes = (CHUNK / 16) * (D / 16);
+        lda.srcStride = (CHUNK * C0_NUM_PER_FRACTAL) / (C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL);
+        lda.dstGap = 0;
+        lda.ifTranspose = false;
+        AscendC::LoadData(l0A, l1A, lda);
+
+        AscendC::LoadData2DParams ldb;
+        ldb.startIndex = 0;
+        ldb.repeatTimes = (D / 16) * (CHUNK / 16);
+        ldb.srcStride = 1;  // reverted: srcStride=8 made a working single tile hang
+        ldb.dstGap = 0;
+        ldb.ifTranspose = false;
+        AscendC::LoadData(l0B, l1B, ldb);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)0);

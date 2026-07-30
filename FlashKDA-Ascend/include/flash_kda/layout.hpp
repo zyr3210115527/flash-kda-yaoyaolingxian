@@ -1,9 +1,34 @@
 #pragma once
 
+// layout.hpp is shared by the device kernels and the host launch code, so the
+// AscendC and catlass headers are only pulled in when the CCE frontend is
+// compiling. The host side needs FwdParams and the workspace offsets, neither
+// of which depends on the device intrinsics.
+#ifdef __CCE__
 #include "kernel_operator.h"
 #include "catlass/arch/arch.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/layout/layout.hpp"
+#else
+// FLASH_KDA_HOST_SHIM: host-side stand-ins for the device-only names that
+// appear in FwdParams and the workspace offset arithmetic. The capacities are
+// the Atlas A2 values from catlass/arch/arch.hpp; the element types are only
+// ever used in sizeof() on the host, never to hold a value.
+#include <cstdint>
+
+using GM_ADDR = uint8_t *;
+
+namespace flash_kda_host_detail {
+struct BF16Storage { uint16_t bits; };
+struct FP16Storage { uint16_t bits; };
+}  // namespace flash_kda_host_detail
+
+// Only sizeof() of these is ever used on the host. torch may already provide
+// bfloat16_t/half in scope, so the host names are kept distinct and the
+// element types alias them below.
+using FlashKdaHostBF16 = flash_kda_host_detail::BF16Storage;
+using FlashKdaHostFP16 = flash_kda_host_detail::FP16Storage;
+#endif
 
 namespace flash_kda {
 
@@ -17,18 +42,28 @@ constexpr int D = 128;  // K = V = 128
 // Ascend architecture tag. CATLASS_ARCH selects the SoC generation:
 //   2201 -> Atlas A2 / A3 (Ascend 910B / 910C)
 //   3510 -> Ascend 950
+#ifdef __CCE__
 #if defined(CATLASS_ARCH) && CATLASS_ARCH == 3510
 using ArchTag = Catlass::Arch::Ascend950;
 #else
 using ArchTag = Catlass::Arch::AtlasA2;
 #endif
+#endif
 
 // Memory sizes. Names must match catlass/arch/arch.hpp exactly.
+#ifdef __CCE__
 constexpr uint32_t UB_SIZE  = ArchTag::UB_SIZE;
 constexpr uint32_t L1_SIZE  = ArchTag::L1_SIZE;
 constexpr uint32_t L0A_SIZE = ArchTag::L0A_SIZE;
 constexpr uint32_t L0B_SIZE = ArchTag::L0B_SIZE;
 constexpr uint32_t L0C_SIZE = ArchTag::L0C_SIZE;
+#else
+constexpr uint32_t UB_SIZE  = 192 * 1024;
+constexpr uint32_t L1_SIZE  = 512 * 1024;
+constexpr uint32_t L0A_SIZE = 64 * 1024;
+constexpr uint32_t L0B_SIZE = 64 * 1024;
+constexpr uint32_t L0C_SIZE = 128 * 1024;
+#endif
 
 // Fractal block: 16x16 elements. For 2-byte types one fractal is 512 bytes.
 constexpr int C0_NUM_PER_FRACTAL = 16;
@@ -44,8 +79,13 @@ constexpr int C0_NUM_PER_FRACTAL = 16;
 // exponent widths (5 vs 8), so reinterpreting one as the other yields garbage,
 // not merely reduced precision.
 
+#ifdef __CCE__
 using BF16 = bfloat16_t;
 using FP16 = half;
+#else
+using BF16 = FlashKdaHostBF16;
+using FP16 = FlashKdaHostFP16;
+#endif
 using FP32 = float;
 
 // ============================================================
@@ -150,5 +190,29 @@ struct FwdParams {
     int state_fp32;
     int is_varlen;
 };
+
+// ============================================================
+// Workspace sizing (host and device)
+// ============================================================
+//
+// Derived from WorkspaceSizes so the host allocation and the kernel's offset
+// arithmetic cannot drift apart. The draft duplicated the byte arithmetic by
+// hand, so adding a workspace field silently under-allocated.
+
+// Byte offset within the workspace of kernel 2's live recurrent state.
+inline int64_t get_state_ws_offset(int64_t T_total, int64_t H, int64_t N = 1)
+{
+    // Upper bound: each of the N sequences can contribute one partial tile
+    // beyond the floor division.
+    const int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+    return H * total_tiles * WorkspaceSizes::kPerTile;
+}
+
+inline int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1)
+{
+    // Per-tile region, then one [D, D] fp32 state per (sequence, head) that
+    // kernel 2 carries across chunks.
+    return get_state_ws_offset(T_total, H, N) + N * H * D * D * 4;
+}
 
 }  // namespace flash_kda

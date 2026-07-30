@@ -110,16 +110,20 @@ public:
                 BuildU(params, headIdx, tileIdx, bos + t * CHUNK, len);
             }
             AscendC::PipeBarrier<PIPE_ALL>();
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-            Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+            if (subIdx == 0) {
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
+                Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+            }
 
             // Round 2: combine out, then decay and update the state.
             if (active) {
                 FinishOut(params, headIdx, tileIdx, bos + t * CHUNK, len);
             }
             AscendC::PipeBarrier<PIPE_ALL>();
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-            Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+            if (subIdx == 0) {
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
+                Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+            }
 
             // Round 2's GEMMs are done: out can be summed and stored, and the
             // state advanced with k_res^T @ u.

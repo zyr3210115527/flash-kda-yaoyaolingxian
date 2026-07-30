@@ -8,18 +8,19 @@
  *   - Kernel launch dispatch
  */
 
+#include <torch/extension.h>
 #include <torch/torch.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <acl/acl.h>
 #include <tiling/platform/platform_ascendc.h>
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <optional>
 #include <stdexcept>
 
 #include "flash_kda/fwd.h"
 #include "flash_kda/layout.hpp"
-#include "flash_kda/utils.hpp"
 
 namespace py = pybind11;
 using namespace flash_kda;
@@ -29,7 +30,7 @@ namespace {
 void check_tensor(const at::Tensor& t, const char* name, torch::ScalarType expected_dtype,
                   bool require_cuda = true) {
     if (require_cuda) {
-        TORCH_CHECK(t.is_npu(), name, " must be on NPU");
+        TORCH_CHECK(t.is_privateuseone(), name, " must be on NPU");
     }
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
     TORCH_CHECK(t.scalar_type() == expected_dtype, name, " has wrong dtype");
@@ -71,14 +72,14 @@ void fwd(
 
     if (has_state_in) {
         auto& is = initial_state.value();
-        TORCH_CHECK(is.is_npu() && is.is_contiguous(), "initial_state must be contiguous NPU tensor");
+        TORCH_CHECK(is.is_privateuseone() && is.is_contiguous(), "initial_state must be contiguous NPU tensor");
         TORCH_CHECK(is.scalar_type() == torch::kBFloat16 || is.scalar_type() == torch::kFloat32,
                      "initial_state must be bfloat16 or float32");
         if (is.scalar_type() == torch::kFloat32) state_fp32 = true;
     }
     if (has_state_out) {
         auto& fs = final_state.value();
-        TORCH_CHECK(fs.is_npu() && fs.is_contiguous(), "final_state must be contiguous NPU tensor");
+        TORCH_CHECK(fs.is_privateuseone() && fs.is_contiguous(), "final_state must be contiguous NPU tensor");
         TORCH_CHECK(fs.scalar_type() == torch::kBFloat16 || fs.scalar_type() == torch::kFloat32,
                      "final_state must be bfloat16 or float32");
         if (fs.scalar_type() == torch::kFloat32) state_fp32 = true;
@@ -123,7 +124,7 @@ void fwd(
     if (is_varlen) {
         TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
         auto& cu_seqlens_t = cu_seqlens.value();
-        TORCH_CHECK(cu_seqlens_t.is_npu(), "cu_seqlens must be on NPU");
+        TORCH_CHECK(cu_seqlens_t.is_privateuseone(), "cu_seqlens must be on NPU");
         TORCH_CHECK(cu_seqlens_t.scalar_type() == torch::kLong, "cu_seqlens must be int64");
         TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
@@ -164,24 +165,26 @@ void fwd(
     auto g_3d = g.reshape({T_total, H, D_dim});
     auto out_3d = out.reshape({T_total, H, D_dim});
 
-    // Transpose beta: [T_total, H] -> [H, T_total] (kernel accesses by head first)
+    // beta stays in its native [T_total, H] layout; the kernel reads a chunk's
+    // 16 values with a stride of H. Transposing here would materialize a
+    // device-side copy for no benefit.
     auto beta_2d = beta.reshape({T_total, H});
-    auto beta_t = beta_2d.t().contiguous();
 
     // Build params
     FwdParams params{};
-    params.q = reinterpret_cast<__gm__ BF16*>(q_3d.data_ptr());
-    params.k = reinterpret_cast<__gm__ BF16*>(k_3d.data_ptr());
-    params.v = reinterpret_cast<__gm__ BF16*>(v_3d.data_ptr());
-    params.g = reinterpret_cast<__gm__ BF16*>(g_3d.data_ptr());
-    params.beta = reinterpret_cast<__gm__ BF16*>(beta_t.data_ptr());
-    params.A_log = reinterpret_cast<__gm__ FP32*>(A_log.data_ptr());
-    params.dt_bias = reinterpret_cast<__gm__ FP32*>(dt_bias.data_ptr());
-    params.out = reinterpret_cast<__gm__ BF16*>(out_3d.data_ptr());
-    params.workspace = reinterpret_cast<__gm__ uint8_t*>(workspace.data_ptr());
-    params.initial_state = has_state_in ? initial_state->data_ptr() : nullptr;
-    params.final_state = has_state_out ? final_state->data_ptr() : nullptr;
-    params.cu_seqlens = const_cast<__gm__ int64_t*>(cu_seqlens_dev);
+    params.q = reinterpret_cast<GM_ADDR>(q_3d.data_ptr());
+    params.k = reinterpret_cast<GM_ADDR>(k_3d.data_ptr());
+    params.v = reinterpret_cast<GM_ADDR>(v_3d.data_ptr());
+    params.g = reinterpret_cast<GM_ADDR>(g_3d.data_ptr());
+    params.beta = reinterpret_cast<GM_ADDR>(beta_2d.data_ptr());
+    params.A_log = reinterpret_cast<GM_ADDR>(A_log.data_ptr());
+    params.dt_bias = reinterpret_cast<GM_ADDR>(dt_bias.data_ptr());
+    params.out = reinterpret_cast<GM_ADDR>(out_3d.data_ptr());
+    params.workspace = reinterpret_cast<GM_ADDR>(workspace.data_ptr());
+    params.initial_state = has_state_in ? reinterpret_cast<GM_ADDR>(initial_state->data_ptr()) : nullptr;
+    params.final_state = has_state_out ? reinterpret_cast<GM_ADDR>(final_state->data_ptr()) : nullptr;
+    params.cu_seqlens =
+        reinterpret_cast<GM_ADDR>(const_cast<int64_t *>(cu_seqlens_dev));
     params.scale = static_cast<float>(scale);
     // Raw lower_bound, no log2(e). The CUDA kernel folds log2(e) in because it
     // decays with ex2 (2^x); this port uses the natural Exp, so pre-multiplying
@@ -205,10 +208,6 @@ void fwd(
     launch_fwd_recurrence(params, stream);
 }
 
-int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N) {
-    return flash_kda::get_workspace_size(T_total, H, N);
-}
-
 PYBIND11_MODULE(_C, m) {
     m.def("fwd", &fwd, "FlashKDA Forward (Ascend)",
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
@@ -218,7 +217,8 @@ PYBIND11_MODULE(_C, m) {
         py::arg("initial_state") = py::none(), py::arg("final_state") = py::none(),
         py::arg("cu_seqlens") = py::none());
     m.def("get_workspace_size",
-        &get_workspace_size,
+        static_cast<int64_t (*)(int64_t, int64_t, int64_t)>(
+            &flash_kda::get_workspace_size),
         "Get workspace size in bytes",
         py::arg("T_total"), py::arg("H"),
         py::arg("N") = 1);

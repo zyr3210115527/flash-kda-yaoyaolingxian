@@ -65,28 +65,4 @@ __aicore__ inline uint16_t Nd2NzNStride()
     return 1;
 }
 
-// ============================================================
-// Host-side workspace sizing
-// ============================================================
-//
-// Derived from WorkspaceSizes so the host allocation and the kernel's offset
-// arithmetic cannot drift apart. The draft duplicated the byte arithmetic by
-// hand in this file, so adding a workspace field silently under-allocated.
-
-// Byte offset within the workspace of kernel 2's live recurrent state.
-inline int64_t get_state_ws_offset(int64_t T_total, int64_t H, int64_t N = 1)
-{
-    // Upper bound: each of the N sequences can contribute one partial tile
-    // beyond the floor division.
-    const int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
-    return H * total_tiles * WorkspaceSizes::kPerTile;
-}
-
-inline int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1)
-{
-    // Per-tile region, then one [D, D] fp32 state per (sequence, head) that
-    // kernel 2 carries across chunks.
-    return get_state_ws_offset(T_total, H, N) + N * H * D * D * 4;
-}
-
 }  // namespace flash_kda

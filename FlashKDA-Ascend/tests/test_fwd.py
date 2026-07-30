@@ -4,6 +4,7 @@ Compares flash_kda.fwd() output against the PyTorch reference implementation.
 """
 
 import torch
+import torch_npu  # registers the npu device with torch
 import math
 import pytest
 

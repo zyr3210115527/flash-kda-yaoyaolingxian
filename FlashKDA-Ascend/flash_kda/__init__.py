@@ -1,6 +1,7 @@
 """FlashKDA: Flash Kimi Delta Attention (Ascend NPU)"""
 
 import torch
+import torch_npu  # registers the npu device with torch
 from flash_kda._C import fwd as _fwd_raw, get_workspace_size
 
 
