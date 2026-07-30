@@ -2,12 +2,103 @@
 
 ## Where things stand
 
-Both kernels are **rewritten and compile as real device objects**, the Python
-extension **builds and links**, and the kernel **launches on a real 910B3**.
-It currently **hangs in the compute** with `aicore execution times out`.
+Both kernels are **rewritten**, the extension **builds and links**, and it
+**launches on a real 910B3**. Kernel1 has been restructured to four
+single-core-type launches and its two AIV phases now **run correctly on device**.
+The two AIC (cube) phases still hang, so the forward pass does not complete end
+to end yet.
 
-That is the honest state: from "never compiled" to "compiles, links, launches,
-hangs". The remaining bug is a live debugging problem, not a missing rewrite.
+An AIV-only probe kernel produced **numerically exact** output on the card
+(`exp(0)=1.000000`, `exp(1.27)=3.560853`), so the vector path, the workspace, the
+launch plumbing and the build are all genuinely working.
+
+## The bug is in the cube path, and it is localized
+
+Two findings, both from experiments on hardware.
+
+**1. Cross-core sync does not work from a Python extension.** Seven variants,
+identical two-round handshake:
+
+| Variant | Where | Result |
+|---|---|---|
+| `sync_probe`, blockDim 1 / 2 / 4 | standalone binary | completes |
+| `sync_probe` + `Resource<ArchTag>` member | standalone binary | completes |
+| `sync_probe` + `PipeBarrier<PIPE_ALL>` | standalone binary | completes |
+| `noop` kernel, no handshake | in the .so | completes |
+| handshake only, `FwdParams` by value | in the .so | **hangs** |
+| handshake only, two scalar args | in the .so | **hangs** |
+| kernel1 with all compute removed | in the .so | **hangs** |
+
+The handshake works standalone; a kernel without one works in the extension.
+Only the combination fails.
+
+Ruled out by experiment: blockDim; `Catlass::Arch::Resource` and its `TPipe`;
+`PipeBarrier<PIPE_ALL>`; torch's stream (a private stream with an explicit
+synchronize hangs too); kernel argument size; `aclrtGetHardwareSyncAddr`
+(returns `rc=0` and a plausible address inside the extension); and a missing
+mix-kernel task type — no `KERNEL_TASK_TYPE` / `SetKernelTaskType` exists in
+catlass or in this CANN 8.5.0's `tikcpp` headers.
+
+**So kernel1 was restructured into four separate launches** — AIV prepare, AIC
+L/Mqk, AIV mask, AIC Neumann — ordered by the stream instead of by flags. Every
+inter-phase value already travelled through GM workspace, so this was cheap.
+With all four phase bodies stubbed out, the four launches complete.
+
+**2. With the split in place, the hang is isolated to the cube phases.** Running
+one phase at a time:
+
+| Phase | Core | Result |
+|---|---|---|
+| `RunPrepare` — normalize, gate, cumsum, decay, store | AIV | **completes** |
+| `RunLMqk` — `L = k_dec @ k_inv^T`, `Mqk = q_dec @ k_inv^T` | AIC | **hangs** |
+| `RunMask` — tril mask, beta sigmoid, build `(I - L)` | AIV | **completes** |
+| `RunNeumann` — the inverse | AIC | **hangs** |
+
+Both AIV phases work. Both AIC phases hang. The fault is in the shared cube
+path: `Nd2NzParams` → `LoadData2DParams` → `Mmad` → `FixpipeParamsV220`.
+
+## What to do next
+
+This is the hand-derived stride code, and it should be replaced rather than
+patched — hand-computing fractal strides is the habit that produced the draft
+this rewrite replaced. A malformed `LoadData` descriptor stalling MTE1 forever
+is exactly the symptom.
+
+Replace the hand-rolled descriptors in `Gemm128`, `Gemm16`, `LoadBt` (kernel1)
+and `Gemm`, `GemmAt`, `LoadNd2Nz` (kernel2) with the catlass tile classes, which
+take layout objects and derive every stride themselves:
+
+- `Catlass::Gemm::Tile::CopyGmToL1<ArchTag, GemmType<Element, Layout>>`
+- `Catlass::Gemm::Tile::CopyL1ToL0A<...>` / `CopyL1ToL0B<...>`
+- `Catlass::Gemm::Tile::CopyL0CToGm<...>`
+
+Build layouts with `layout::RowMajor(rows, cols)` and
+`layout::zN::MakeLayout<Element>(rows, cols)`. Model the structure on
+`examples/19_mla/mla_kernel.cpp`. This also deletes `utils.hpp`'s
+`ZnBlockOffsetBytes` / `Nd2NzC0Stride` / `Nd2NzNStride`.
+
+Bisect within `RunLMqk` first — it is the simpler of the two cube phases (one
+`LoadBt` plus two `Gemm128` calls), and whatever fixes it very likely fixes
+`RunNeumann` too.
+
+Kernel2 still uses cross-core handshakes and must get the same split treatment
+once kernel1's cube path runs.
+
+## Diagnostics left in the tree
+
+`src/fwd_kernel1.asc` carries three probe kernels, none on the real path:
+
+- `FlashKdaNoop` / `_C.noop(tensor)` — smallest kernel on this launch path.
+- `FlashKdaAivOnly` / `_C.aiv_only(src, dst)` — AIV vector work, no sync. This
+  is the one that produced exact `exp` output.
+- `FlashKdaSyncOnly` (`FLASH_KDA_SYNC_ONLY=1`) and `FlashKdaSyncSmall`
+  (`FLASH_KDA_SYNC_SMALL=1`) — handshake only, large and small arguments.
+
+`tests/sync_probe.cpp` is the standalone comparison point; build it with the
+command in its header comment.
+
+To re-run the phase bisection, stub any subset of `RunPrepare` / `RunLMqk` /
+`RunMask` / `RunNeumann` with an early `return;`.
 
 ## Two places the code lives
 

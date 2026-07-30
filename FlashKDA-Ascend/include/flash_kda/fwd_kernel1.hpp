@@ -14,11 +14,16 @@
  * scratch, and Fixpipe's F322BF16 mode does the fp32->bf16 rounding on the way
  * out -- which keeps the Neumann iteration entirely on the cube.
  *
- * Two handshakes per tile:
- *   AIV: normalize, gate, cumsum, decay, store   -> elemReady
- *   AIC: L = k_dec @ k_inv^T, Mqk = q_dec @ k_inv^T -> mmaReady
- *   AIV: tril mask + beta sigmoid, build (I - L)  -> elemReady
- *   AIC: Neumann inverse, writes INV             -> mmaReady
+ * PHASES. Four separate kernel launches on one stream, not one kernel with
+ * cross-core handshakes:
+ *   1. AIV  normalize, gate, cumsum, decay, store workspace
+ *   2. AIC  L = k_dec @ k_inv^T, Mqk = q_dec @ k_inv^T
+ *   3. AIV  tril mask + beta sigmoid, build (I - L)
+ *   4. AIC  Neumann inverse, writes INV
+ * Stream order provides the ordering the flags used to, and every inter-phase
+ * value already travels through GM workspace. CrossCoreSetFlag/WaitFlag hangs
+ * when the kernel is launched from a Python extension (see
+ * docs/debugging-notes.md), and single-core-type launches do not.
  *
  * Math, matching FlashKDA/csrc/smxx/fwd_kernel1.cuh:
  *   a = exp(A_log[h]); gv = gate_scale * sigmoid(a * (g + dt_bias[h]))
@@ -35,14 +40,10 @@
 
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/resource.hpp"
-#include "catlass/arch/cross_core_sync.hpp"
 #include "kernel_operator.h"
 
 namespace flash_kda {
 
-// catlass reserves flag ids 8/9/10 and caps user flags at 7.
-constexpr Catlass::Arch::FlagID K1_ELEM_READY = 1;
-constexpr Catlass::Arch::FlagID K1_MMA_READY = 2;
 
 // UB map, AIV only. Phase A and phase B are disjoint: the draft aliased them,
 // so decay read q[row] and wrote k_decayed[row] at one address. ~66 KB of 192.
@@ -96,83 +97,68 @@ public:
         int actualLen;      // real rows; < CHUNK on a tail tile
     };
 
-    template <int32_t CORE_TYPE = g_coreType>
-    CATLASS_DEVICE void operator()(Params const& params);
-
-    template <>
-    CATLASS_DEVICE void operator()<AscendC::AIV>(Params const& params)
+    // Phase entry points. Each runs on one core type only; the four are
+    // launched separately and ordered by the stream. See PHASES note above.
+    CATLASS_DEVICE void RunPrepare(Params const& params)
     {
-        // GetBlockIdx() on the AIV is the sub-core index; dividing by
-        // GetSubBlockNum() recovers the index its paired AIC sees. Without this
-        // the two AIVs process different tiles than the AIC they sync with.
         const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        const uint32_t subIdx = AscendC::GetSubBlockIdx();
         if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
             return;
         }
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
         const int headIdx = static_cast<int>(coreIdx) % params.H;
-        const int tileIdx = static_cast<int>(coreIdx) / params.H;
-
         TileSpan span;
-        ResolveTile(params, tileIdx, span);
-
-        // An out-of-range tile must still complete both handshakes or its AIC
-        // blocks forever. The draft returned early and deadlocked on varlen.
-        const bool active = span.valid && (subIdx == 0);
-
-#ifndef FKDA_SKIP_AIV
-        if (active) {
+        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
+        if (span.valid) {
             Prepare(params, headIdx, span);
-        }
-#endif
-        AscendC::PipeBarrier<PIPE_ALL>();
-        // Only the subcore that did the work signals. Both subcores signalling
-        // sets the flag twice per round against a single AIC wait, and the
-        // leftover counts hang teardown after the kernel itself has finished.
-        if (subIdx == 0) {
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-            Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
-        }
-#ifndef FKDA_SKIP_AIV
-        if (active) {
-            MaskAndBuild(params, headIdx, span);
-        }
-#endif
-        AscendC::PipeBarrier<PIPE_ALL>();
-        if (subIdx == 0) {
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-            Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
         }
     }
 
-    template <>
-    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    CATLASS_DEVICE void RunLMqk(Params const& params)
     {
         const uint32_t coreIdx = AscendC::GetBlockIdx();
         if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
             return;
         }
         const int headIdx = static_cast<int>(coreIdx) % params.H;
-        const int tileIdx = static_cast<int>(coreIdx) / params.H;
-
         TileSpan span;
-        ResolveTile(params, tileIdx, span);
-
-        Catlass::Arch::CrossCoreWaitFlag(elemReady_);
-#ifndef FKDA_SKIP_AIC
+        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
         if (span.valid) {
             ComputeLAndMqk(params, headIdx, span);
         }
-#endif
-        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
+    }
 
-        Catlass::Arch::CrossCoreWaitFlag(elemReady_);
-#if !defined(FKDA_SKIP_AIC) && !defined(FKDA_SKIP_NEUMANN)
+    CATLASS_DEVICE void RunMask(Params const& params)
+    {
+        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
+        const int headIdx = static_cast<int>(coreIdx) % params.H;
+        TileSpan span;
+        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
+        if (span.valid) {
+            MaskAndBuild(params, headIdx, span);
+        }
+    }
+
+    CATLASS_DEVICE void RunNeumann(Params const& params)
+    {
+        const uint32_t coreIdx = AscendC::GetBlockIdx();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
+        const int headIdx = static_cast<int>(coreIdx) % params.H;
+        TileSpan span;
+        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
         if (span.valid) {
             ComputeNeumann(params, headIdx, span);
         }
-#endif
-        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
     }
 
 private:
@@ -805,8 +791,6 @@ private:
     }
 
     Catlass::Arch::Resource<ArchTag> resource_;
-    Catlass::Arch::CrossCoreFlag elemReady_{K1_ELEM_READY};
-    Catlass::Arch::CrossCoreFlag mmaReady_{K1_MMA_READY};
 };
 
 }  // namespace flash_kda

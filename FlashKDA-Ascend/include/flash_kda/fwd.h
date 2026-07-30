@@ -43,4 +43,7 @@ void launch_sync_only(const FwdParams& params, aclrtStream stream);
 // Diagnostic: same handshake, small scalar args.
 void launch_sync_small(int units, aclrtStream stream);
 
+// Diagnostic: AIV-only, no cross-core sync.
+void launch_aiv_only(GM_ADDR src, GM_ADDR dst, aclrtStream stream);
+
 }  // namespace flash_kda

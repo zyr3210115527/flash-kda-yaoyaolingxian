@@ -223,7 +223,16 @@ int64_t noop(at::Tensor flag) {
     return 0;
 }
 
+int64_t aiv_only(at::Tensor src, at::Tensor dst) {
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
+    flash_kda::launch_aiv_only(reinterpret_cast<GM_ADDR>(src.data_ptr()),
+                               reinterpret_cast<GM_ADDR>(dst.data_ptr()), stream);
+    return 0;
+}
+
 PYBIND11_MODULE(_C, m) {
+    m.def("aiv_only", &aiv_only, "AIV-only vector kernel probe",
+          py::arg("src"), py::arg("dst"));
     m.def("noop", &noop, "no-op kernel launch probe", py::arg("flag"));
     m.def("fwd", &fwd, "FlashKDA Forward (Ascend)",
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
