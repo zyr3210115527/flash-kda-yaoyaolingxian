@@ -1,68 +1,84 @@
 #pragma once
 
-#include "kernel_operator.h"
+#include "flash_kda/layout.hpp"
 
 namespace flash_kda {
 
 // ============================================================
-// Math approximations matching FlashKDA CUDA kernel behavior
+// Device-side math helpers
 // ============================================================
+//
+// Everything callable from a kernel must be marked __aicore__, otherwise the
+// device compiler rejects it as "calling a host function from device code".
+// The inherited draft declared these plain `inline` and called them from
+// __aicore__ code, which cannot compile.
+//
+// Note on exp bases: the CUDA kernel uses ex2 (2^x) and folds log2(e) into
+// gate_scale on the host. This port uses the natural Exp everywhere and passes
+// the raw lower_bound as gate_scale, which is exactly equivalent:
+//   2^(lower_bound * log2e * s) == e^(lower_bound * s)
+// Mixing the two conventions -- ex2's gate_scale with a natural Exp -- inflates
+// every decay exponent by log2(e) ~= 1.4427, which is the single largest
+// numerical error in the inherited draft.
 
-// Sigmoid via tanh approximation: sigmoid(x) = tanh(x/2) / 2 + 0.5
-// Matches the CUDA asm "tanh.approx.f32" used in the original kernel
-inline float sigmoid_tanh_approx(float x) {
-    float th;
-    // AscendC vector tanh — on AIV use AscendC::Tanh
-    // For scalar use in host/tiling code:
-    th = tanhf(x * 0.5f);
-    return th * 0.5f + 0.5f;
-}
+constexpr float kLog2E = 1.4426950408889634f;
+constexpr float kLn2   = 0.6931471805599453f;
 
-// exp2 approximation matching CUDA "ex2.approx.ftz.f32"
-// On Ascend AIV, use AscendC::Exp which computes e^x
-// For scalar: use expf()
-inline float ex2_approx(float x) {
-    // CUDA ex2.approx computes 2^x
-    // AscendC::Exp computes e^x
-    // Convert: 2^x = e^(x * ln2)
-    return expf(x * 0.6931471805599453f);
-}
-
-// BF16 <-> FP32 conversion
-// On AIV, use AscendC::Cast for vectorized conversion
-// For scalar:
-inline float bf16_to_f32(uint16_t bf16_bits) {
-    // BF16 = FP32 with lower 16 bits zeroed
-    uint32_t f32_bits = static_cast<uint32_t>(bf16_bits) << 16;
-    float result;
-    memcpy(&result, &f32_bits, sizeof(float));
-    return result;
-}
-
-inline uint16_t f32_to_bf16(float x) {
-    // Round-to-nearest-even truncation
-    uint32_t f32_bits;
-    memcpy(&f32_bits, &x, sizeof(uint32_t));
-    // Add rounding bias
-    f32_bits += 0x8000;
-    // Truncate lower 16 bits
-    return static_cast<uint16_t>(f32_bits >> 16);
+// 2^x expressed through the natural exponential, for parity with CUDA's
+// ex2.approx.ftz.f32 when a call site genuinely needs base 2.
+__aicore__ inline float Exp2Scalar(float x)
+{
+    return AscendC::ScalarCast<float, float, AscendC::RoundMode::CAST_NONE>(0.0f) + expf(x * kLn2);
 }
 
 // ============================================================
-// Workspace size computation (host-side, matches CUDA version)
+// Fractal (zN) addressing
 // ============================================================
+//
+// zN is row-major *inside* a 16x16 fractal and column-major *between*
+// fractals (catlass/include/catlass/layout/matrix.hpp). The inherited draft
+// had the two block indices swapped, which happened to be harmless only
+// because every matrix it addressed had a single fractal row (rows == 16).
+// It breaks the moment a matrix is taller than one fractal -- which is the
+// case for the [128, 128] recurrent state.
+//
+// Returns a byte offset for element type of size `elem_bytes`.
+__aicore__ inline int ZnBlockOffsetBytes(int row_blk, int col_blk, int rows, int elem_bytes)
+{
+    const int rows_round = (rows + C0_NUM_PER_FRACTAL - 1) / C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL;
+    const int fractal_bytes = C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL * elem_bytes;
+    return (col_blk * (rows_round / C0_NUM_PER_FRACTAL) + row_blk) * fractal_bytes;
+}
 
-inline int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1) {
-    constexpr int CHUNK = 16;
-    constexpr int D = 128;
+// Nd2Nz destination strides for a [rows, cols] RowMajor GM source landing in
+// L1 as zN. Derived from catlass gemm/tile/atlasa2/copy_gm_to_l1.hpp:
+//   dstNzC0Stride = layoutDst.stride(3) / ELE_NUM_PER_C0 = roundUp16(rows)
+//   dstNzNStride  = layoutDst.stride(0) / ELE_NUM_PER_C0 = 1
+// The draft had these two swapped.
+__aicore__ inline uint16_t Nd2NzC0Stride(int rows)
+{
+    return static_cast<uint16_t>((rows + C0_NUM_PER_FRACTAL - 1) / C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL);
+}
 
-    // Upper bound: each of N sequences adds at most 1 extra tile vs floor division
-    int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+__aicore__ inline uint16_t Nd2NzNStride()
+{
+    return 1;
+}
 
-    int64_t per_tile_bytes = 4 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
+// ============================================================
+// Host-side workspace sizing
+// ============================================================
+//
+// Derived from WorkspaceSizes so the host allocation and the kernel's offset
+// arithmetic cannot drift apart. The draft duplicated the byte arithmetic by
+// hand in this file, so adding a workspace field silently under-allocated.
 
-    return H * total_tiles * per_tile_bytes;
+inline int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1)
+{
+    // Upper bound: each of the N sequences can contribute one partial tile
+    // beyond the floor division.
+    const int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+    return H * total_tiles * WorkspaceSizes::kPerTile;
 }
 
 }  // namespace flash_kda

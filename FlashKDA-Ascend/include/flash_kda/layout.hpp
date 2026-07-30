@@ -7,54 +7,78 @@
 
 namespace flash_kda {
 
+// ============================================================
 // Compile-time constants
+// ============================================================
+
 constexpr int CHUNK = 16;
 constexpr int D = 128;  // K = V = 128
 
-// Ascend architecture tag
+// Ascend architecture tag. CATLASS_ARCH selects the SoC generation:
+//   2201 -> Atlas A2 / A3 (Ascend 910B / 910C)
+//   3510 -> Ascend 950
+#if defined(CATLASS_ARCH) && CATLASS_ARCH == 3510
+using ArchTag = Catlass::Arch::Ascend950;
+#else
 using ArchTag = Catlass::Arch::AtlasA2;
+#endif
 
-// Memory sizes from architecture
-constexpr int UB_SIZE = ArchTag::UBSize;      // 192KB
-constexpr int L1_SIZE = ArchTag::L1Size;      // 512KB
-constexpr int L0A_SIZE = ArchTag::L0ASize;    // 64KB
-constexpr int L0B_SIZE = ArchTag::L0BSize;    // 64KB
-constexpr int L0C_SIZE = ArchTag::L0CSize;    // 128KB
+// Memory sizes. Names must match catlass/arch/arch.hpp exactly.
+constexpr uint32_t UB_SIZE  = ArchTag::UB_SIZE;
+constexpr uint32_t L1_SIZE  = ArchTag::L1_SIZE;
+constexpr uint32_t L0A_SIZE = ArchTag::L0A_SIZE;
+constexpr uint32_t L0B_SIZE = ArchTag::L0B_SIZE;
+constexpr uint32_t L0C_SIZE = ArchTag::L0C_SIZE;
 
-// Fractal block size: 16 elements per fractal inner dimension
+// Fractal block: 16x16 elements. For 2-byte types one fractal is 512 bytes.
 constexpr int C0_NUM_PER_FRACTAL = 16;
 
-// Byte size of one fractal block [C0, C0] in L1 zN/nZ format
-// Used for computing L1 offsets when indexing into fractal-layout data
-constexpr int FRACTAL_BLOCK_BYTES = C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL * sizeof(half);  // 512
+// ============================================================
+// Data types
+// ============================================================
+//
+// The inherited draft used `ascendFloat16`, which does not exist in AscendC,
+// and claimed "AscendC uses half for bf16 on A2". Both are wrong: bf16 is
+// `bfloat16_t`, and Atlas A2 supports it natively for both MMAD and the
+// Fixpipe F322BF16 quantization mode. half and bfloat16_t have different
+// exponent widths (5 vs 8), so reinterpreting one as the other yields garbage,
+// not merely reduced precision.
 
-// Helper: L1 zN offset for block [n_blk, d_blk] of a [rows, cols] matrix
-// rows/cols must be multiples of C0_NUM_PER_FRACTAL
-inline constexpr int l1_zn_block_off(int n_blk, int d_blk, int cols) {
-    return (n_blk * (cols / C0_NUM_PER_FRACTAL) + d_blk) * FRACTAL_BLOCK_BYTES;
-}
-
-// Data type aliases matching AscendC types
-using BF16 = ascendFloat16;  // Note: AscendC uses half for bf16 on A2
+using BF16 = bfloat16_t;
 using FP16 = half;
 using FP32 = float;
 
-// Workspace layout: RowMajor in GM (compatible with PyTorch tensors)
-// Internal layouts: Fractal (zN/nZ) in L1/L0
+// ============================================================
+// Workspace layout
+// ============================================================
+//
+// RowMajor in GM so it interoperates with PyTorch tensors. Fractal (zN/nZ)
+// layouts only exist inside L1/L0.
+//
+// On Atlas A2 the AIC has no access to UB, and there is no L0C->UB path
+// (catlass gemm/tile/copy_l0c_to_ub.hpp is guarded by CATLASS_ARCH == 3510).
+// Every AIC result therefore lands in GM via Fixpipe, and the AIV reads it
+// back from GM. The scratch slots below exist for that hand-off.
 
-// Workspace per-tile byte sizes (same as CUDA version)
 struct WorkspaceSizes {
-    static constexpr int kKDecayed  = CHUNK * D * 2;        // 4096
-    static constexpr int kQDecayed  = CHUNK * D * 2;        // 4096
-    static constexpr int kKInv      = CHUNK * D * 2;        // 4096
-    static constexpr int kKRestored = CHUNK * D * 2;        // 4096
-    static constexpr int kGTotal    = D * 4;                 // 512
-    static constexpr int kINV       = CHUNK * CHUNK * 2;     // 512
-    static constexpr int kMqk       = CHUNK * CHUNK * 2;     // 512
-    static constexpr int64_t kPerTile = kKDecayed + kQDecayed + kKInv + kKRestored + kGTotal + kINV + kMqk;
+    static constexpr int kKDecayed  = CHUNK * D * sizeof(BF16);   // 4096
+    static constexpr int kQDecayed  = CHUNK * D * sizeof(BF16);   // 4096
+    static constexpr int kKInv      = CHUNK * D * sizeof(BF16);   // 4096
+    static constexpr int kKRestored = CHUNK * D * sizeof(BF16);   // 4096
+    static constexpr int kGTotal    = D * sizeof(FP32);           // 512
+    static constexpr int kINV       = CHUNK * CHUNK * sizeof(BF16);  // 512
+    static constexpr int kMqk       = CHUNK * CHUNK * sizeof(BF16);  // 512
+
+    // AIC <-> AIV scratch for the L / Neumann hand-off. Six 16x16 slots:
+    // L, (I-L), L^2, L^4, L^8, and one spare accumulator.
+    static constexpr int kScratchSlot = CHUNK * CHUNK * sizeof(FP32);  // 1024
+    static constexpr int kNumScratch  = 6;
+    static constexpr int kScratch     = kScratchSlot * kNumScratch;    // 6144
+
+    static constexpr int64_t kPerTile =
+        kKDecayed + kQDecayed + kKInv + kKRestored + kGTotal + kINV + kMqk + kScratch;
 };
 
-// Workspace offsets within the per-tile buffer
 struct WorkspaceOffsets {
     static constexpr int kKDecayed  = 0;
     static constexpr int kQDecayed  = kKDecayed + WorkspaceSizes::kKDecayed;
@@ -63,35 +87,42 @@ struct WorkspaceOffsets {
     static constexpr int kGTotal    = kKRestored + WorkspaceSizes::kKRestored;
     static constexpr int kINV       = kGTotal + WorkspaceSizes::kGTotal;
     static constexpr int kMqk       = kINV + WorkspaceSizes::kINV;
+    static constexpr int kScratch   = kMqk + WorkspaceSizes::kMqk;
 };
 
-// Kernel parameters passed from host
+// ============================================================
+// Kernel parameters
+// ============================================================
+
 struct FwdParams {
-    // Input pointers (GM)
-    __gm__ BF16* q;           // [B, T, H, D] or [1, T_total, H, D]
-    __gm__ BF16* k;
-    __gm__ BF16* v;
-    __gm__ BF16* g;
-    __gm__ BF16* beta;        // [B, T, H]
-    __gm__ FP32* A_log;       // [H]
-    __gm__ FP32* dt_bias;     // [H, D]
+    // Inputs (GM)
+    GM_ADDR q;         // [T_total, H, D] bf16
+    GM_ADDR k;
+    GM_ADDR v;
+    GM_ADDR g;
+    GM_ADDR beta;      // [H, T_total] bf16 (transposed host-side)
+    GM_ADDR A_log;     // [H] fp32
+    GM_ADDR dt_bias;   // [H, D] fp32
 
-    // Output pointer
-    __gm__ BF16* out;         // [B, T, H, D]
+    // Output
+    GM_ADDR out;       // [T_total, H, D] bf16
 
-    // Workspace pointer
-    __gm__ uint8_t* workspace;
+    GM_ADDR workspace;
 
-    // State pointers (may be nullptr)
-    __gm__ void* initial_state;  // [N, H, D, D] bf16 or fp32
-    __gm__ void* final_state;
+    // Optional state, nullptr when absent
+    GM_ADDR initial_state;  // [N, H, D, D]
+    GM_ADDR final_state;
 
-    // Varlen
-    __gm__ int64_t* cu_seqlens;  // [N+1], may be nullptr
+    GM_ADDR cu_seqlens;     // [N+1] int64, nullptr when not varlen
 
     // Scalars
     float scale;
-    float gate_scale;  // lower_bound * 1.4426950408889634
+
+    // Gate lower bound. The CUDA kernel folds log2(e) in here because it uses
+    // ex2 (2^x); this port uses the natural Exp, so gate_scale is the raw
+    // lower_bound and the two agree exactly:
+    //   2^(lower_bound * log2e * s) == e^(lower_bound * s)
+    float gate_scale;
 
     // Dimensions
     int T_total;
@@ -99,7 +130,7 @@ struct FwdParams {
     int N;
     int total_tiles;
 
-    // Flags (packed as int for easy host-side construction)
+    // Feature flags (runtime, not template specialization)
     int has_state_in;
     int has_state_out;
     int state_fp32;
