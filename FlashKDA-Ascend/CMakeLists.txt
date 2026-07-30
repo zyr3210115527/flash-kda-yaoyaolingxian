@@ -39,6 +39,11 @@ add_compile_options(
   $<$<COMPILE_LANGUAGE:ASC>:-Wno-macro-redefined>
   $<$<COMPILE_LANGUAGE:ASC>:-Wno-ignored-attributes>
   $<$<COMPILE_LANGUAGE:ASC>:-Wno-unused-value>)
+
+# Device codegen options catlass's own examples build with.
+add_compile_options(
+  "SHELL:$<$<COMPILE_LANGUAGE:ASC>:-mllvm -cce-aicore-record-overflow=true>"
+  "SHELL:$<$<COMPILE_LANGUAGE:ASC>:-mllvm -cce-aicore-dcci-insert-for-scalar=false>")
 add_link_options($<$<COMPILE_LANGUAGE:ASC>:-Wno-unused-command-line-argument>)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
@@ -55,7 +60,11 @@ include_directories(
   ${Python3_SITELIB}/torch_npu/include
   ${ASCEND_HOME_PATH}/include)
 
-link_directories(${ASCEND_HOME_PATH}/lib64 ${Python3_SITELIB}/torch_npu/lib)
+# devlib holds the device-side runtime halves; catlass links it and we must too.
+link_directories(
+  ${ASCEND_HOME_PATH}/lib64
+  ${ASCEND_HOME_PATH}/aarch64-linux/devlib
+  ${Python3_SITELIB}/torch_npu/lib)
 
 # Device code. The .asc extension is what selects the Ascend compiler; the
 # language property must be set per source file, not per target (the inherited
@@ -79,11 +88,22 @@ pybind11_add_module(_C src/flash_kda.cpp ${FLASH_KDA_KERNEL_SOURCES})
 target_link_libraries(_C PRIVATE
   ${TORCH_LIBRARIES}
   torch_npu
+  # Same set catlass's examples link, in the same order.
   ascendc_runtime
   runtime
+  profapi
+  mmpa
+  ascend_dump
+  c_sec
+  error_manager
   ascendcl
   tiling_api
-  platform)
+  nnopbase
+  platform
+  dl
+  ascendalog
+  unified_dlog
+  ascend_hal)
 
 install(TARGETS _C
   LIBRARY DESTINATION .

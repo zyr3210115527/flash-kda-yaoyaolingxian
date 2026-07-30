@@ -18,6 +18,7 @@
 #include <pybind11/stl.h>
 #include <optional>
 #include <stdexcept>
+#include <cstdlib>
 
 #include "flash_kda/fwd.h"
 #include "flash_kda/layout.hpp"
@@ -204,11 +205,26 @@ void fwd(
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
 
     // Launch kernels
+    if (std::getenv("FLASH_KDA_SYNC_SMALL") != nullptr) {
+        launch_sync_small(total_tiles * int(H), stream);
+        return;
+    }
+    if (std::getenv("FLASH_KDA_SYNC_ONLY") != nullptr) {
+        launch_sync_only(params, stream);
+        return;
+    }
     launch_fwd_prepare(params, stream);
     launch_fwd_recurrence(params, stream);
 }
 
+int64_t noop(at::Tensor flag) {
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
+    flash_kda::launch_noop(reinterpret_cast<GM_ADDR>(flag.data_ptr()), stream);
+    return 0;
+}
+
 PYBIND11_MODULE(_C, m) {
+    m.def("noop", &noop, "no-op kernel launch probe", py::arg("flag"));
     m.def("fwd", &fwd, "FlashKDA Forward (Ascend)",
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
         py::arg("scale"), py::arg("out"),

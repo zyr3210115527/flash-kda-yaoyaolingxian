@@ -128,41 +128,86 @@ differences between it and the real kernel are now the entire suspect list:
 | stream | own `aclrtCreateStream` | torch's `c10_npu::getCurrentNPUStream()` |
 | launched from | plain C++ `main` | pybind module inside torch |
 
-**blockDim is ruled out**: `sync_probe 1`, `sync_probe 2` and `sync_probe 4` all
-report `sync result: 0 (completed)`. A single-block mixed AIC/AIV launch with
-cross-core sync is fine on its own.
+### The bisection, as far as it got
 
-**torch's stream is ruled out**: launching on a private `aclrtCreateStream` with
-an explicit `aclrtSynchronizeStream` still hangs (and hangs *inside* `fwd`,
-since the sync is now in the launch function). The patch used for this is
-`scratchpad/patch_stream.py`; the source has been restored.
+Every row below was run on the 910B3. The handshake is identical in all of them
+— two rounds, `CrossCoreSetFlag<0x2, PIPE_MTE3>` from AIV against
+`CrossCoreWaitFlag` on AIC and back.
 
-### The remaining structural difference — start here
+| Variant | Where it runs | Result |
+|---|---|---|
+| `sync_probe`, blockDim 1 / 2 / 4 | standalone binary | **completes** |
+| `sync_probe` + `Resource<ArchTag>` member | standalone binary | **completes** |
+| `sync_probe` + `PipeBarrier<PIPE_ALL>` | standalone binary | **completes** |
+| `noop` kernel, no handshake | inside the .so, torch stream | **completes** (writes 42) |
+| `sync_only`: handshake only, `FwdParams` by value | inside the .so | **hangs** |
+| `sync_small`: handshake only, two scalar args | inside the .so | **hangs** |
+| `FwdPrepareKernel`, all compute compiled out | inside the .so | **hangs** |
 
-`sync_probe`'s kernel class has **no members**. `FwdPrepareKernel` holds a
-`Catlass::Arch::Resource<ArchTag> resource_`, and that member is constructed
-even when every compute path is compiled out — which is exactly the
-configuration that still hangs.
+So: the handshake works in a standalone binary and hangs inside the Python
+extension, and a kernel *without* a handshake works fine inside that same
+extension. The two ingredients are individually fine and fail in combination.
 
-`Resource`'s constructor contains an `AscendC::TPipe` and calls `pipe.Destroy()`
-in its body, with this comment in `catlass/arch/resource.hpp`:
+Also ruled out along the way, each by experiment rather than reasoning:
 
-> The initialization of AscendC::Tpipe will insert some synchronization
-> interfaces, which may conflict with the usage by users. Therefore, the
-> "destroy" interface is used for releasing.
+- blockDim (1 works standalone).
+- `Catlass::Arch::Resource` / its `TPipe` — added to the probe, still completes.
+- `PipeBarrier<PIPE_ALL>` — added to the probe, still completes.
+- torch's stream — launching on a private `aclrtCreateStream` with an explicit
+  synchronize still hangs.
+- Kernel argument size — `sync_small` takes two scalars and still hangs.
+- `aclrtGetHardwareSyncAddr` failing — it returns `rc=0` and a plausible
+  address (`0x3fffffb9000`) inside the extension.
+- Missing link libraries — the module now links exactly what catlass's examples
+  link (`-L$CANN/aarch64-linux/devlib`, plus `ascendc_runtime`, `profapi`,
+  `mmpa`, `ascend_dump`, `c_sec`, `error_manager`, `nnopbase`, `ascendalog`,
+  `unified_dlog`, `ascend_hal`) and compiles with catlass's two extra `-mllvm`
+  codegen options. Still hangs. **Keep this change** — the old link line was
+  genuinely incomplete even if it is not the bug.
+- A missing mix-kernel task-type declaration — no `KERNEL_TASK_TYPE`,
+  `KERNEL_TYPE_MIX_AIC_1_1` or `SetKernelTaskType` exists anywhere in catlass or
+  in this CANN 8.5.0's `tikcpp` headers, so there is no such knob to set.
 
-So `Resource` and hand-written cross-core sync are documented as potentially
-conflicting, and this kernel uses both. Next experiments, in order:
+### Where to pick this up
 
-1. Add a `Catlass::Arch::Resource<ArchTag>` member to `sync_probe`'s class,
-   change nothing else, and rerun. If the probe now hangs, that is the bug,
-   reproduced in 40 lines.
-2. If so, look at how `examples/19_mla/mla_kernel.cpp` orders `Resource`
-   construction against its cross-core flags — it uses both successfully, so
-   the ordering or the flag setup there is the pattern to copy.
-3. Consider whether `resource_` should be constructed inside each
-   `operator()<AIC>` / `operator()<AIV>` body rather than as a class member, so
-   its TPipe lifetime does not span the handshakes.
+The evidence says the problem is how a cross-core-synchronized kernel is
+*launched from a shared library inside the torch process*, not anything about
+the kernel body. Two concrete next steps:
+
+1. **Reproduce it standalone-but-shared.** Build `sync_probe` as a `.so` with a
+   tiny C `main` that `dlopen`s it, no torch at all. If it hangs, the variable is
+   "kernel in a shared object" and the answer is probably a device-binary
+   registration issue — the `.o` for a `.asc` file inside a shared module may not
+   get its FFTS/sync section wired up the way a linked executable does. Compare
+   `readelf -S` on the standalone binary against the `.so`.
+2. **Ask the other direction.** Does any *documented* CANN example ship an
+   AIC/AIV cross-core kernel inside a Python extension? catlass's
+   `.agents/skills/catlass-example-to-torch-intf` template exists precisely for
+   torch integration — check whether every example it supports is single-core-type
+   (`00_basic_matmul` is pure AIC). If so, cross-core sync inside a torch
+   extension may be unsupported, and kernel1 should be restructured to avoid it:
+   split it into two separate kernel launches (an AIV-only prepare and an
+   AIC-only GEMM pass) communicating through GM, with the stream providing the
+   ordering instead of CrossCore flags.
+
+Option 2 is the more likely resolution and is also a simpler design. It costs one
+extra kernel launch per tile-group and removes cross-core sync from the project
+entirely.
+
+### Diagnostics left in the tree
+
+`src/fwd_kernel1.asc` carries three extra kernels, all reachable without
+touching the real path:
+
+- `FlashKdaNoop` / `_C.noop(tensor)` — smallest kernel on this launch path.
+- `FlashKdaSyncOnly` — handshake only, `FwdParams` by value.
+  Set `FLASH_KDA_SYNC_ONLY=1`.
+- `FlashKdaSyncSmall` — handshake only, scalar args.
+  Set `FLASH_KDA_SYNC_SMALL=1`.
+
+`FKDA_SKIP_AIV` / `FKDA_SKIP_AIC` / `FKDA_SKIP_NEUMANN` compile out kernel1's
+stages while keeping handshake counts symmetric. `tests/sync_probe.cpp` is the
+standalone comparison point; build it with the command in its header comment.
 
 ### Suspects for later, once it runs at all
 

@@ -34,4 +34,13 @@ void launch_fwd_prepare(const FwdParams& params, aclrtStream stream);
 //   state = state * exp(g_total) + k_restored^T @ u
 void launch_fwd_recurrence(const FwdParams& params, aclrtStream stream);
 
+// Diagnostic: smallest kernel on this launch path.
+void launch_noop(GM_ADDR flag, aclrtStream stream);
+
+// Diagnostic: handshake only, real FwdParams by value.
+void launch_sync_only(const FwdParams& params, aclrtStream stream);
+
+// Diagnostic: same handshake, small scalar args.
+void launch_sync_small(int units, aclrtStream stream);
+
 }  // namespace flash_kda
