@@ -1,5 +1,7 @@
 #pragma once
 
+#include <acl/acl.h>
+
 #include "flash_kda/layout.hpp"
 
 namespace flash_kda {

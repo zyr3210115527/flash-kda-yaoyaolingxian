@@ -183,7 +183,10 @@ void fwd(
     params.final_state = has_state_out ? final_state->data_ptr() : nullptr;
     params.cu_seqlens = const_cast<__gm__ int64_t*>(cu_seqlens_dev);
     params.scale = static_cast<float>(scale);
-    params.gate_scale = static_cast<float>(lower_bound * 1.4426950408889634);
+    // Raw lower_bound, no log2(e). The CUDA kernel folds log2(e) in because it
+    // decays with ex2 (2^x); this port uses the natural Exp, so pre-multiplying
+    // here would inflate every decay exponent by 1.4427x.
+    params.gate_scale = static_cast<float>(lower_bound);
     params.T_total = int(T_total);
     params.H = int(H);
     params.N = int(N_val);
@@ -192,6 +195,7 @@ void fwd(
     params.has_state_out = has_state_out ? 1 : 0;
     params.state_fp32 = state_fp32 ? 1 : 0;
     params.is_varlen = is_varlen ? 1 : 0;
+    params.state_ws_offset = flash_kda::get_state_ws_offset(T_total, H, N_val);
 
     // Get ACL stream
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);

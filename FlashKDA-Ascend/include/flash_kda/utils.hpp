@@ -24,12 +24,12 @@ namespace flash_kda {
 constexpr float kLog2E = 1.4426950408889634f;
 constexpr float kLn2   = 0.6931471805599453f;
 
-// 2^x expressed through the natural exponential, for parity with CUDA's
-// ex2.approx.ftz.f32 when a call site genuinely needs base 2.
-__aicore__ inline float Exp2Scalar(float x)
-{
-    return AscendC::ScalarCast<float, float, AscendC::RoundMode::CAST_NONE>(0.0f) + expf(x * kLn2);
-}
+// There is no scalar exp intrinsic on the aicore -- only `sqrt` and friends
+// exist in __clang_cce_aicore_functions.h. Anything exponential has to go
+// through the vector unit, so a "scalar" exp means staging the value in UB,
+// running AscendC::Exp over one datablock, and reading it back. Callers that
+// need this use ExpViaVector in the kernel; there is deliberately no scalar
+// helper here that would look cheap and silently fail to compile.
 
 // ============================================================
 // Fractal (zN) addressing
@@ -73,12 +73,20 @@ __aicore__ inline uint16_t Nd2NzNStride()
 // arithmetic cannot drift apart. The draft duplicated the byte arithmetic by
 // hand in this file, so adding a workspace field silently under-allocated.
 
-inline int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1)
+// Byte offset within the workspace of kernel 2's live recurrent state.
+inline int64_t get_state_ws_offset(int64_t T_total, int64_t H, int64_t N = 1)
 {
     // Upper bound: each of the N sequences can contribute one partial tile
     // beyond the floor division.
     const int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
     return H * total_tiles * WorkspaceSizes::kPerTile;
+}
+
+inline int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1)
+{
+    // Per-tile region, then one [D, D] fp32 state per (sequence, head) that
+    // kernel 2 carries across chunks.
+    return get_state_ws_offset(T_total, H, N) + N * H * D * D * 4;
 }
 
 }  // namespace flash_kda

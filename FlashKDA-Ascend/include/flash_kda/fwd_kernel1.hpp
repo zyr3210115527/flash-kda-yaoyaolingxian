@@ -1,933 +1,781 @@
-/**
- * FlashKDA Ascend — Kernel 1: Prepare (Full Implementation)
- *
- * AIV-dominant kernel that computes per-tile intermediates for KDA.
- *
- * Data flow:
- *   AIV: GM → UB (load) → vector ops → UB → GM (store workspace)
- *   AIC: GM → L1 (Nd2Nz) → L0A/L0B (LoadData) → MMAD → L0C → UB (Fixpipe)
- *
- * AIC-AIV sync: CrossCoreSetFlag/WaitFlag (2 rounds)
- *   Round 1: AIV signals ELEM_READY → AIC computes L, Mqk → signals MMA_READY
- *   Round 2: AIV applies mask, constructs (I-L) → signals ELEM_READY
- *            → AIC computes Neumann INV → signals MMA_READY
- */
-
 #pragma once
+
+/**
+ * FlashKDA Ascend -- Kernel 1: Prepare.
+ *
+ * Rewritten from scratch; the inherited draft survives only as a statement of
+ * algorithmic intent (see ../../STATUS.md).
+ *
+ * Grid: one core per (tile, head), where a tile is CHUNK = 16 tokens.
+ *
+ * Atlas A2 constrains the split in ways the draft ignored: the AIC has no UB
+ * access and no vector unit, there is no L1<->UB path, and L0C drains only to
+ * L1 or GM (L0C->UB is Ascend 950 only). So AIC results travel through GM
+ * scratch, and Fixpipe's F322BF16 mode does the fp32->bf16 rounding on the way
+ * out -- which keeps the Neumann iteration entirely on the cube.
+ *
+ * Two handshakes per tile:
+ *   AIV: normalize, gate, cumsum, decay, store   -> elemReady
+ *   AIC: L = k_dec @ k_inv^T, Mqk = q_dec @ k_inv^T -> mmaReady
+ *   AIV: tril mask + beta sigmoid, build (I - L)  -> elemReady
+ *   AIC: Neumann inverse, writes INV             -> mmaReady
+ *
+ * Math, matching FlashKDA/csrc/smxx/fwd_kernel1.cuh:
+ *   a = exp(A_log[h]); gv = gate_scale * sigmoid(a * (g + dt_bias[h]))
+ *   gc = inclusive cumsum of gv down the 16 rows; g_total = exp(gc[last])
+ *   q_dec = q_hat * exp(gc) * scale     k_dec = k_hat * exp(gc)
+ *   k_inv = k_hat * exp(-gc)            k_res = k_hat * exp(-gc) * g_total
+ * where q_hat/k_hat are L2-normalized. CUDA uses ex2 with log2(e) folded into
+ * gate_scale; we use the natural exp with the raw lower_bound, which is the
+ * same function.
+ */
 
 #include "flash_kda/layout.hpp"
 #include "flash_kda/utils.hpp"
+
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/resource.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
 #include "kernel_operator.h"
 
-using namespace AscendC;
-using namespace Catlass::Arch;
-
 namespace flash_kda {
 
-// ============================================================
-// Constants
-// ============================================================
-constexpr int K1_ELEM_READY_ID = 1;
-constexpr int K1_MMA_READY_ID  = 2;
+// catlass reserves flag ids 8/9/10 and caps user flags at 7.
+constexpr Catlass::Arch::FlagID K1_ELEM_READY = 1;
+constexpr Catlass::Arch::FlagID K1_MMA_READY = 2;
 
-// UB buffer byte sizes
-constexpr int UB_Q_SIZE       = CHUNK * D * sizeof(half);      // 4096
-constexpr int UB_K_SIZE       = CHUNK * D * sizeof(half);      // 4096
-constexpr int UB_G_BF16_SIZE  = CHUNK * D * sizeof(half);      // 4096
-constexpr int UB_G_FP32_SIZE  = CHUNK * D * sizeof(float);     // 8192
-constexpr int UB_BETA_SIZE    = 32 * sizeof(half);              // 64
-constexpr int UB_DT_BIAS_SIZE = D * sizeof(float);              // 512
-constexpr int UB_G_TOTAL_SIZE = D * sizeof(float);              // 512
-constexpr int UB_LM_SIZE      = CHUNK * CHUNK * sizeof(half);   // 512
+// UB map, AIV only. Phase A and phase B are disjoint: the draft aliased them,
+// so decay read q[row] and wrote k_decayed[row] at one address. ~66 KB of 192.
+struct K1Ub {
+    static constexpr uint32_t kQ      = 0;
+    static constexpr uint32_t kK      = kQ + CHUNK * D * 2;
+    static constexpr uint32_t kG      = kK + CHUNK * D * 2;
+    static constexpr uint32_t kQf     = kG + CHUNK * D * 2;
+    static constexpr uint32_t kKf     = kQf + CHUNK * D * 4;
+    static constexpr uint32_t kGc     = kKf + CHUNK * D * 4;
+    static constexpr uint32_t kTmp    = kGc + CHUNK * D * 4;
+    static constexpr uint32_t kTmp2   = kTmp + CHUNK * D * 4;
+    static constexpr uint32_t kGTotal = kTmp2 + CHUNK * D * 4;
+    static constexpr uint32_t kDtBias = kGTotal + D * 4;
+    static constexpr uint32_t kKDec   = kDtBias + D * 4;
+    static constexpr uint32_t kQDec   = kKDec + CHUNK * D * 2;
+    static constexpr uint32_t kKInv   = kQDec + CHUNK * D * 2;
+    static constexpr uint32_t kKRes   = kKInv + CHUNK * D * 2;
+    static constexpr uint32_t kLf     = kKRes + CHUNK * D * 2;
+    static constexpr uint32_t kMqkF   = kLf + CHUNK * CHUNK * 4;
+    static constexpr uint32_t kSmallA = kMqkF + CHUNK * CHUNK * 4;
+    static constexpr uint32_t kSmallB = kSmallA + 512;
+    static constexpr uint32_t kReduce = kSmallB + 512;
+    static constexpr uint32_t kScalar = kReduce + 1024;
+    static constexpr uint32_t kEnd    = kScalar + 256;
+};
+static_assert(K1Ub::kEnd < ArchTag::UB_SIZE, "kernel1 UB budget exceeded");
 
-// UB offsets — Phase A (inputs)
-constexpr int UB_Q_OFF        = 0;
-constexpr int UB_K_OFF        = UB_Q_OFF + UB_Q_SIZE;
-constexpr int UB_G_BF16_OFF  = UB_K_OFF + UB_K_SIZE;
-constexpr int UB_G_FP32_OFF  = UB_G_BF16_OFF + UB_G_BF16_SIZE;
-constexpr int UB_BETA_OFF    = UB_G_FP32_OFF + UB_G_FP32_SIZE;
-constexpr int UB_DT_BIAS_OFF = UB_BETA_OFF + UB_BETA_SIZE;
+// L1 map, AIC only.
+struct K1L1 {
+    static constexpr uint32_t kA      = 0;
+    static constexpr uint32_t kB      = kA + CHUNK * D * 2;
+    static constexpr uint32_t kSmallA = kB + CHUNK * D * 2;
+    static constexpr uint32_t kSmallB = kSmallA + 512;
+    static constexpr uint32_t kEnd    = kSmallB + 512;
+};
+static_assert(K1L1::kEnd < ArchTag::L1_SIZE, "kernel1 L1 budget exceeded");
 
-// UB offsets — Phase B (intermediates, reuse Phase A space via union)
-constexpr int UB_K_DECAYED_OFF  = 0;
-constexpr int UB_Q_DECAYED_OFF  = UB_K_DECAYED_OFF + UB_Q_SIZE;
-constexpr int UB_K_INV_OFF      = UB_Q_DECAYED_OFF + UB_Q_SIZE;
-constexpr int UB_K_RESTORED_OFF = UB_K_INV_OFF + UB_Q_SIZE;
-constexpr int UB_G_TOTAL_OFF    = UB_K_RESTORED_OFF + UB_Q_SIZE;
-constexpr int UB_L_OFF          = UB_G_TOTAL_OFF + UB_G_TOTAL_SIZE;
-constexpr int UB_INV_OFF        = UB_L_OFF + UB_LM_SIZE;
-constexpr int UB_MQK_OFF        = UB_INV_OFF + UB_LM_SIZE;
-
-// Temp fp32 buffer for L2 norm (reuses g_fp32 space)
-constexpr int UB_NORM_TMP_OFF = UB_G_FP32_OFF;
-
-// ============================================================
-// AIC L1 buffer layout for Kernel 1
-// ============================================================
-// For compute_l_mqk_aic: need k_decayed, q_decayed, k_inv in L1
-// For compute_neumann_inv_aic: need L, INV, Lpow, tmp in L1
-//
-// L1 offsets (bytes, aligned to 128)
-constexpr int L1_KD_OFF    = 0;                          // [CHUNK, D] bf16 zN = 4096
-constexpr int L1_QD_OFF    = L1_KD_OFF + 4096;           // [CHUNK, D] bf16 zN = 4096
-constexpr int L1_KI_OFF    = L1_QD_OFF + 4096;           // [CHUNK, D] bf16 nZ = 4096
-constexpr int L1_L_OFF     = L1_KI_OFF + 4096;           // [16, 16] fp16 zN = 512
-constexpr int L1_INV_OFF   = L1_L_OFF + 512;             // [16, 16] fp16 zN = 512
-constexpr int L1_LPOW_OFF  = L1_INV_OFF + 512;           // [16, 16] fp16 zN = 512
-constexpr int L1_TMP_OFF   = L1_LPOW_OFF + 512;          // [16, 16] fp16 zN = 512
-// Total L1: ~13KB
-
-// ============================================================
-// Kernel 1 class
-// ============================================================
 class FwdPrepareKernel {
 public:
-    __aicore__ FwdPrepareKernel() {}
+    using Params = FwdParams;
 
-    TPipe pipe;
-    TBuf<PIPE_V> ubBuf;
+    CATLASS_DEVICE
+    FwdPrepareKernel() {}
 
-    // AIC buffers
-    TBuf<PIPE_MTE1> l1Buf;   // L1 buffer
-    TBuf<PIPE_M>    l0ABuf;  // L0A buffer
-    TBuf<PIPE_M>    l0BBuf;  // L0B buffer
-    TBuf<PIPE_M>    l0CBuf;  // L0C buffer
+    // Where a tile lives.
+    struct TileSpan {
+        bool valid;
+        int64_t wsTile;     // byte offset of this tile's H-block group
+        int64_t tokenBase;  // first token in the flattened [T_total, H, D]
+        int actualLen;      // real rows; < CHUNK on a tail tile
+    };
 
     template <int32_t CORE_TYPE = g_coreType>
-    __aicore__ void operator()(const FwdParams& params);
+    CATLASS_DEVICE void operator()(Params const& params);
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIV>(Params const& params)
+    {
+        // GetBlockIdx() on the AIV is the sub-core index; dividing by
+        // GetSubBlockNum() recovers the index its paired AIC sees. Without this
+        // the two AIVs process different tiles than the AIC they sync with.
+        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        const uint32_t subIdx = AscendC::GetSubBlockIdx();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
+        const int headIdx = static_cast<int>(coreIdx) % params.H;
+        const int tileIdx = static_cast<int>(coreIdx) / params.H;
+
+        TileSpan span;
+        ResolveTile(params, tileIdx, span);
+
+        // An out-of-range tile must still complete both handshakes or its AIC
+        // blocks forever. The draft returned early and deadlocked on varlen.
+        const bool active = span.valid && (subIdx == 0);
+
+        if (active) {
+            Prepare(params, headIdx, span);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
+
+        Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+        if (active) {
+            MaskAndBuild(params, headIdx, span);
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
+        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
+
+        Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
+    }
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    {
+        const uint32_t coreIdx = AscendC::GetBlockIdx();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
+        const int headIdx = static_cast<int>(coreIdx) % params.H;
+        const int tileIdx = static_cast<int>(coreIdx) / params.H;
+
+        TileSpan span;
+        ResolveTile(params, tileIdx, span);
+
+        Catlass::Arch::CrossCoreWaitFlag(elemReady_);
+        if (span.valid) {
+            ComputeLAndMqk(params, headIdx, span);
+        }
+        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
+
+        Catlass::Arch::CrossCoreWaitFlag(elemReady_);
+        if (span.valid) {
+            ComputeNeumann(params, headIdx, span);
+        }
+        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
+    }
 
 private:
-    CrossCoreFlag elemReady{K1_ELEM_READY_ID};
-    CrossCoreFlag mmaReady{K1_MMA_READY_ID};
-
-    // Workspace index (set by AIC entry point for loading from GM)
-    int ws_idx_ = 0;
-
-    // ============================================================
-    // AIV: Load inputs from GM to UB
-    // ============================================================
-    __aicore__ void load_inputs_aiv(
-        const FwdParams& params, int head_idx,
-        int64_t bos, int local_t
-    ) {
-        int64_t t_offset = bos + local_t * CHUNK;
-
-        // Load q [CHUNK, D] bf16: GM → UB
-        {
-            LocalTensor<half> dst = ubBuf.GetBufferAddr<half>(UB_Q_OFF);
-            GlobalTensor<half> src;
-            src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.q) + head_idx * params.T_total * D + t_offset * D,
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Load k [CHUNK, D] bf16
-        {
-            LocalTensor<half> dst = ubBuf.GetBufferAddr<half>(UB_K_OFF);
-            GlobalTensor<half> src;
-            src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.k) + head_idx * params.T_total * D + t_offset * D,
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Load g [CHUNK, D] bf16
-        {
-            LocalTensor<half> dst = ubBuf.GetBufferAddr<half>(UB_G_BF16_OFF);
-            GlobalTensor<half> src;
-            src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.g) + head_idx * params.T_total * D + t_offset * D,
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Load beta [CHUNK] bf16 (padded to 32 for alignment)
-        {
-            LocalTensor<half> dst = ubBuf.GetBufferAddr<half>(UB_BETA_OFF);
-            GlobalTensor<half> src;
-            src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.beta) + head_idx * params.T_total + t_offset,
-                CHUNK);
-            DataCopy(dst, src, CHUNK);
-        }
-
-        // Load dt_bias [D] fp32 for this head
-        {
-            LocalTensor<float> dst = ubBuf.GetBufferAddr<float>(UB_DT_BIAS_OFF);
-            GlobalTensor<float> src;
-            src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ float*>(params.dt_bias) + head_idx * D,
-                D);
-            DataCopy(dst, src, D);
-        }
-
-        PipeBarrier<PIPE_V>();
-    }
-
-    // ============================================================
-    // AIV: L2 normalize q and k rows
-    // ============================================================
-    __aicore__ void l2_normalize_aiv() {
-        LocalTensor<half> q_ub = ubBuf.GetBufferAddr<half>(UB_Q_OFF);
-        LocalTensor<half> k_ub = ubBuf.GetBufferAddr<half>(UB_K_OFF);
-        LocalTensor<float> sq_ub = ubBuf.GetBufferAddr<float>(UB_NORM_TMP_OFF);
-
-        constexpr float eps = 1e-6f;
-
-        for (int row = 0; row < CHUNK; ++row) {
-            // --- Normalize q row ---
-            LocalTensor<float> q_fp32 = sq_ub;
-            Cast(q_fp32, q_ub[row * D], RoundMode::CAST_NONE, D);
-            Mul(q_fp32, q_fp32, q_fp32, D);
-
-            // ReduceSum: dst[0] = sum(src[0..D-1])
-            LocalTensor<float> sum_dst = ubBuf.GetBufferAddr<float>(UB_NORM_TMP_OFF + D * sizeof(float));
-            LocalTensor<float> reduce_tmp = ubBuf.GetBufferAddr<float>(UB_NORM_TMP_OFF + (D + 1) * sizeof(float));
-            ReduceSum(sum_dst, q_fp32, reduce_tmp, D);
-            float q_sq = sum_dst.GetValue(0);
-            float q_inv = 1.0f / sqrtf(q_sq + eps);
-            Muls(q_ub[row * D], q_ub[row * D], half(q_inv), D);
-
-            // --- Normalize k row ---
-            Cast(q_fp32, k_ub[row * D], RoundMode::CAST_NONE, D);
-            Mul(q_fp32, q_fp32, q_fp32, D);
-            ReduceSum(sum_dst, q_fp32, reduce_tmp, D);
-            float k_sq = sum_dst.GetValue(0);
-            float k_inv = 1.0f / sqrtf(k_sq + eps);
-            Muls(k_ub[row * D], k_ub[row * D], half(k_inv), D);
-        }
-
-        PipeBarrier<PIPE_V>();
-    }
-
-    // ============================================================
-    // AIV: Gate activation + cumulative sum
-    // ============================================================
-    __aicore__ void gate_activation_cumsum_aiv(
-        const FwdParams& params, int head_idx, int actual_len
-    ) {
-        LocalTensor<half> g_bf16_ub = ubBuf.GetBufferAddr<half>(UB_G_BF16_OFF);
-        LocalTensor<float> g_fp32_ub = ubBuf.GetBufferAddr<float>(UB_G_FP32_OFF);
-        LocalTensor<float> dt_bias_ub = ubBuf.GetBufferAddr<float>(UB_DT_BIAS_OFF);
-        LocalTensor<float> g_total_ub = ubBuf.GetBufferAddr<float>(UB_G_TOTAL_OFF);
-        LocalTensor<half> k_ub = ubBuf.GetBufferAddr<half>(UB_K_OFF);
-
-        // Read A_log for this head (scalar GM read)
-        float a_log_val = 0.0f;
-        {
-            GlobalTensor<float> g_a_log;
-            g_a_log.SetGlobalBuffer(
-                reinterpret_cast<__gm__ float*>(params.A_log) + head_idx, 1);
-            LocalTensor<float> a_log_tmp = ubBuf.GetBufferAddr<float>(UB_G_TOTAL_OFF);
-            DataCopy(a_log_tmp, g_a_log, 1);
-            PipeBarrier<PIPE_V>();
-            a_log_val = a_log_tmp.GetValue(0);
-        }
-        float a_log_exp = expf(a_log_val);
-        float gate_scale = params.gate_scale;
-
-        // Initialize g_total to zero
-        Duplicate(g_total_ub, 0.0f, D);
-
-        for (int row = 0; row < CHUNK; ++row) {
-            // Cast g_bf16[row*D ..] to fp32
-            Cast(g_fp32_ub[row * D], g_bf16_ub[row * D], RoundMode::CAST_NONE, D);
-
-            if (row < actual_len) {
-                // g_fp32 += dt_bias
-                Add(g_fp32_ub[row * D], g_fp32_ub[row * D], dt_bias_ub, D);
-                // g_fp32 *= a_log_exp
-                Muls(g_fp32_ub[row * D], g_fp32_ub[row * D], a_log_exp, D);
-                // sigmoid via tanh: sigmoid(x) = tanh(x/2) * 0.5 + 0.5
-                Muls(g_fp32_ub[row * D], g_fp32_ub[row * D], 0.5f, D);
-                Tanh(g_fp32_ub[row * D], g_fp32_ub[row * D], D);
-                Muls(g_fp32_ub[row * D], g_fp32_ub[row * D], 0.5f, D);
-                Adds(g_fp32_ub[row * D], g_fp32_ub[row * D], 0.5f, D);
-                // g_fp32 *= gate_scale
-                Muls(g_fp32_ub[row * D], g_fp32_ub[row * D], gate_scale, D);
-            } else {
-                Duplicate(g_fp32_ub[row * D], 0.0f, D);
-            }
-
-            // Cumulative sum: g_fp32[row*D + d] += g_total[d]
-            Add(g_fp32_ub[row * D], g_fp32_ub[row * D], g_total_ub, D);
-            // Update g_total = new running sum
-            DataCopy(g_total_ub, g_fp32_ub[row * D], D);
-        }
-
-        // Zero k for tail rows
-        if (actual_len < CHUNK) {
-            for (int row = actual_len; row < CHUNK; ++row) {
-                Duplicate(k_ub[row * D], half(0), D);
-            }
-        }
-
-        PipeBarrier<PIPE_V>();
-    }
-
-    // ============================================================
-    // AIV: Decay application
-    // ============================================================
-    __aicore__ void decay_apply_aiv(float scale) {
-        LocalTensor<half> q_ub = ubBuf.GetBufferAddr<half>(UB_Q_OFF);
-        LocalTensor<half> k_ub = ubBuf.GetBufferAddr<half>(UB_K_OFF);
-        LocalTensor<float> g_fp32_ub = ubBuf.GetBufferAddr<float>(UB_G_FP32_OFF);
-        LocalTensor<float> g_total_ub = ubBuf.GetBufferAddr<float>(UB_G_TOTAL_OFF);
-
-        LocalTensor<half> q_decayed_ub = ubBuf.GetBufferAddr<half>(UB_Q_DECAYED_OFF);
-        LocalTensor<half> k_decayed_ub = ubBuf.GetBufferAddr<half>(UB_K_DECAYED_OFF);
-        LocalTensor<half> k_inv_ub = ubBuf.GetBufferAddr<half>(UB_K_INV_OFF);
-        LocalTensor<half> k_restored_ub = ubBuf.GetBufferAddr<half>(UB_K_RESTORED_OFF);
-
-        // Compute exp(g_total) once
-        Exp(g_total_ub, g_total_ub, D);
-
-        for (int row = 0; row < CHUNK; ++row) {
-            int row_off = row * D;
-
-            // exp_cumsum = exp(g_fp32[row, :])
-            LocalTensor<float> exp_cumsum = g_fp32_ub[row_off];
-            Exp(exp_cumsum, exp_cumsum, D);
-
-            // Cast exp_cumsum to bf16
-            LocalTensor<half> exp_bf16 = ubBuf.GetBufferAddr<half>(UB_G_FP32_OFF + row_off * sizeof(half));
-            Cast(exp_bf16, exp_cumsum, RoundMode::CAST_RINT, D);
-
-            // k_decayed = k * exp_cumsum
-            Mul(k_decayed_ub[row_off], k_ub[row_off], exp_bf16, D);
-
-            // q_decayed = q * exp_cumsum * scale
-            Mul(q_decayed_ub[row_off], q_ub[row_off], exp_bf16, D);
-            Muls(q_decayed_ub[row_off], q_decayed_ub[row_off], half(scale), D);
-
-            // inv_cumsum = 1.0 / exp_cumsum
-            LocalTensor<float> inv_cumsum_f = exp_cumsum;
-            Duplicate(inv_cumsum_f, 1.0f, D);
-            Div(inv_cumsum_f, inv_cumsum_f, exp_cumsum, D);
-
-            // k_inv = k * inv_cumsum
-            LocalTensor<half> inv_bf16 = ubBuf.GetBufferAddr<half>(UB_G_FP32_OFF + row_off * sizeof(half));
-            Cast(inv_bf16, inv_cumsum_f, RoundMode::CAST_RINT, D);
-            Mul(k_inv_ub[row_off], k_ub[row_off], inv_bf16, D);
-
-            // k_restored = k_inv * exp(g_total)
-            LocalTensor<half> exp_gt_bf16 = ubBuf.GetBufferAddr<half>(UB_G_FP32_OFF + row_off * sizeof(half));
-            Cast(exp_gt_bf16, g_total_ub, RoundMode::CAST_RINT, D);
-            Mul(k_restored_ub[row_off], k_inv_ub[row_off], exp_gt_bf16, D);
-        }
-
-        PipeBarrier<PIPE_V>();
-    }
-
-    // ============================================================
-    // AIV: Lower-triangular mask + beta sigmoid + (I-L) construction
-    // ============================================================
-    __aicore__ void tril_mask_aiv(
-        const FwdParams& params, int head_idx, int64_t t_offset
-    ) {
-        LocalTensor<half> L_ub = ubBuf.GetBufferAddr<half>(UB_L_OFF);
-        LocalTensor<half> INV_ub = ubBuf.GetBufferAddr<half>(UB_INV_OFF);
-        LocalTensor<half> Mqk_ub = ubBuf.GetBufferAddr<half>(UB_MQK_OFF);
-        LocalTensor<half> beta_ub = ubBuf.GetBufferAddr<half>(UB_BETA_OFF);
-
-        for (int i = 0; i < CHUNK; ++i) {
-            half beta_val = beta_ub.GetValue(i);
-            float beta_f = static_cast<float>(beta_val);
-            float sig_beta = sigmoid_tanh_approx(beta_f);
-            half sig_beta_h = half(sig_beta);
-
-            for (int j = 0; j < CHUNK; ++j) {
-                int idx = i * CHUNK + j;
-                half l_val = L_ub.GetValue(idx);
-
-                if (i <= j) {
-                    L_ub.SetValue(idx, half(0));
-                    INV_ub.SetValue(idx, (i == j) ? half(1.0f) : half(0));
-                } else {
-                    half masked = half(static_cast<float>(l_val) * sig_beta);
-                    L_ub.SetValue(idx, masked);
-                    INV_ub.SetValue(idx, half(-static_cast<float>(masked)));
-                }
-
-                if (i < j) {
-                    Mqk_ub.SetValue(idx, half(0));
-                }
-            }
-        }
-
-        PipeBarrier<PIPE_V>();
-    }
-
-    // ============================================================
-    // AIV: Store workspace arrays to GM
-    // ============================================================
-    __aicore__ void store_workspace_aiv(const FwdParams& params, int ws_idx) {
-        int64_t ws_base = (int64_t)ws_idx * WorkspaceSizes::kPerTile;
-
-        // Store k_decayed [CHUNK, D] bf16
-        {
-            LocalTensor<half> src = ubBuf.GetBufferAddr<half>(UB_K_DECAYED_OFF);
-            GlobalTensor<half> dst;
-            dst.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kKDecayed),
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Store q_decayed [CHUNK, D] bf16
-        {
-            LocalTensor<half> src = ubBuf.GetBufferAddr<half>(UB_Q_DECAYED_OFF);
-            GlobalTensor<half> dst;
-            dst.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kQDecayed),
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Store k_inv [CHUNK, D] bf16
-        {
-            LocalTensor<half> src = ubBuf.GetBufferAddr<half>(UB_K_INV_OFF);
-            GlobalTensor<half> dst;
-            dst.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kKInv),
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Store k_restored [CHUNK, D] bf16
-        {
-            LocalTensor<half> src = ubBuf.GetBufferAddr<half>(UB_K_RESTORED_OFF);
-            GlobalTensor<half> dst;
-            dst.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kKRestored),
-                CHUNK * D);
-            DataCopy(dst, src, CHUNK * D);
-        }
-
-        // Store g_total [D] fp32
-        {
-            LocalTensor<float> src = ubBuf.GetBufferAddr<float>(UB_G_TOTAL_OFF);
-            GlobalTensor<float> dst;
-            dst.SetGlobalBuffer(
-                reinterpret_cast<__gm__ float*>(params.workspace + ws_base + WorkspaceOffsets::kGTotal),
-                D);
-            DataCopy(dst, src, D);
-        }
-
-        PipeBarrier<PIPE_V>();
-    }
-
-    // ============================================================
-    // AIC: Compute L = k_decayed @ k_inv^T and Mqk = q_decayed @ k_inv^T
-    // ============================================================
-    // k_decayed [16, 128] @ k_inv^T [128, 16] → L [16, 16]
-    //   = sum_{k=0}^{7} k_decayed[16, 16k:16(k+1)] @ k_inv[16, 16k:16(k+1)]^T
-    //   Each sub-product: 16x16x16 MMAD
-    //
-    // Same for Mqk with q_decayed as A operand.
-    //
-    // Data path: GM (workspace) → L1 (Nd2Nz) → L0A/L0B (LoadData) → MMAD → L0C → UB (Fixpipe)
-    __aicore__ void compute_l_mqk_aic(const FwdParams& params) {
-        int64_t ws_base = (int64_t)ws_idx_ * WorkspaceSizes::kPerTile;
-
-        // Nd2NzParams for GM RowMajor [CHUNK, D] → L1 zN format
-        // Used for A operands (k_decayed, q_decayed)
-        Nd2NzParams nd2nzA;
-        nd2nzA.ndNum = 1;
-        nd2nzA.nValue = CHUNK;     // 16 rows
-        nd2nzA.dValue = D;         // 128 cols
-        nd2nzA.srcDValue = D;      // RowMajor stride = D
-        nd2nzA.srcNdMatrixStride = 0;
-        nd2nzA.dstNzNStride = D / 16;  // zN: N-stride in C0 blocks
-        nd2nzA.dstNzC0Stride = 1;
-        nd2nzA.dstNzMatrixStride = 0;
-
-        // Nd2NzParams for B operand (k_inv) — nZ format
-        Nd2NzParams nd2nzB;
-        nd2nzB.ndNum = 1;
-        nd2nzB.nValue = CHUNK;
-        nd2nzB.dValue = D;
-        nd2nzB.srcDValue = D;
-        nd2nzB.srcNdMatrixStride = 0;
-        nd2nzB.dstNzNStride = D / 16;
-        nd2nzB.dstNzC0Stride = 1;
-        nd2nzB.dstNzMatrixStride = 0;
-
-        // Load k_decayed from workspace GM → L1 zN
-        {
-            LocalTensor<half> l1_dst = l1Buf.GetBufferAddr<half>(L1_KD_OFF);
-            GlobalTensor<half> gm_src;
-            gm_src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kKDecayed),
-                CHUNK * D);
-            DataCopy(l1_dst, gm_src, nd2nzA);
-        }
-
-        // Load q_decayed from workspace GM → L1 zN
-        {
-            LocalTensor<half> l1_dst = l1Buf.GetBufferAddr<half>(L1_QD_OFF);
-            GlobalTensor<half> gm_src;
-            gm_src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kQDecayed),
-                CHUNK * D);
-            DataCopy(l1_dst, gm_src, nd2nzA);
-        }
-
-        // Load k_inv from workspace GM → L1 nZ
-        {
-            LocalTensor<half> l1_dst = l1Buf.GetBufferAddr<half>(L1_KI_OFF);
-            GlobalTensor<half> gm_src;
-            gm_src.SetGlobalBuffer(
-                reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kKInv),
-                CHUNK * D);
-            DataCopy(l1_dst, gm_src, nd2nzB);
-        }
-
-        // Wait for GM → L1 DataCopy to complete
-        SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID0);
-
-        // LoadData params for L1 → L0A (A operand, no transpose)
-        LoadData2DParams ldParamsA;
-        ldParamsA.startIndex = 0;
-        ldParamsA.repeatTimes = 1;   // 16 elements per repeat
-        ldParamsA.srcStride = 1;
-        ldParamsA.sid = 0;
-        ldParamsA.dstGap = 0;
-        ldParamsA.ifTranspose = false;
-        ldParamsA.addrMode = 0;
-
-        // LoadData params for L1 → L0B (B operand, transposed for k_inv^T)
-        LoadData2DParams ldParamsB;
-        ldParamsB.startIndex = 0;
-        ldParamsB.repeatTimes = 1;
-        ldParamsB.srcStride = 1;
-        ldParamsB.sid = 0;
-        ldParamsB.dstGap = 0;
-        ldParamsB.ifTranspose = true;   // k_inv^T: transpose B
-        ldParamsB.addrMode = 0;
-
-        // ---- Compute L = k_decayed @ k_inv^T ----
-        {
-            LocalTensor<float> l0C = l0CBuf.GetBufferAddr<float>(0);
-
-            for (int k = 0; k < D / 16; ++k) {
-                // Load k_decayed[16, 16k:16(k+1)] from L1 → L0A
-                // In zN format, the k-th D-block offset is k * FRACTAL_BLOCK_BYTES
-                LocalTensor<half> l0A = l0ABuf.GetBufferAddr<half>(0);
-                LocalTensor<half> l1A = l1Buf.GetBufferAddr<half>(
-                    L1_KD_OFF + l1_zn_block_off(0, k, D));
-                WaitFlag<HardEvent::M_MTE1>(EVENT_ID0);
-                LoadData(l0A, l1A, ldParamsA);
-
-                // Load k_inv[16, 16k:16(k+1)] from L1 → L0B (transposed)
-                LocalTensor<half> l0B = l0BBuf.GetBufferAddr<half>(0);
-                LocalTensor<half> l1B = l1Buf.GetBufferAddr<half>(
-                    L1_KI_OFF + l1_zn_block_off(0, k, D));
-                LoadData(l0B, l1B, ldParamsB);
-                SetFlag<HardEvent::MTE1_M>(EVENT_ID0);
-
-                // MMAD: l0C += l0A @ l0B
-                WaitFlag<HardEvent::MTE1_M>(EVENT_ID0);
-                MmadParams mmadParams;
-                mmadParams.m = 16;
-                mmadParams.n = 16;
-                mmadParams.k = 16;
-                mmadParams.cmatrixInitVal = (k == 0);  // init accumulator on first k-block
-                mmadParams.unitFlag = 0;
-                Mmad(l0C, l0A, l0B, mmadParams);
-                SetFlag<HardEvent::M_MTE1>(EVENT_ID0);
-            }
-
-            // Fixpipe: L0C → UB (L result)
-            // L0C is fp32 accumulator in zN format; convert to bf16 RowMajor in UB
-            LocalTensor<half> L_ub = ubBuf.GetBufferAddr<half>(UB_L_OFF);
-            SetFlag<HardEvent::M_FIX>(EVENT_ID0);
-            WaitFlag<HardEvent::M_FIX>(EVENT_ID0);
-            FixpipeParamsV220 fixpipeParams;
-            fixpipeParams.nSize = 16;
-            fixpipeParams.mSize = 16;
-            fixpipeParams.srcStride = 1;
-            fixpipeParams.dstStride = CHUNK;  // RowMajor stride in UB
-            fixpipeParams.quantPre = QuantMode_t::F322BF16;
-            fixpipeParams.reluEn = false;
-            fixpipeParams.unitFlag = 0;
-            Fixpipe<half, float, CFG_ROW_MAJOR>(L_ub, l0C, fixpipeParams);
-            SetFlag<HardEvent::FIX_M>(EVENT_ID0);
-            WaitFlag<HardEvent::FIX_M>(EVENT_ID0);
-        }
-
-        // ---- Compute Mqk = q_decayed @ k_inv^T ----
-        // Same structure, different A operand (q_decayed instead of k_decayed)
-        {
-            LocalTensor<float> l0C = l0CBuf.GetBufferAddr<float>(0);
-
-            for (int k = 0; k < D / 16; ++k) {
-                LocalTensor<half> l0A = l0ABuf.GetBufferAddr<half>(0);
-                LocalTensor<half> l1A = l1Buf.GetBufferAddr<half>(
-                    L1_QD_OFF + l1_zn_block_off(0, k, D));
-                WaitFlag<HardEvent::M_MTE1>(EVENT_ID0);
-                LoadData(l0A, l1A, ldParamsA);
-
-                LocalTensor<half> l0B = l0BBuf.GetBufferAddr<half>(0);
-                LocalTensor<half> l1B = l1Buf.GetBufferAddr<half>(
-                    L1_KI_OFF + l1_zn_block_off(0, k, D));
-                LoadData(l0B, l1B, ldParamsB);
-                SetFlag<HardEvent::MTE1_M>(EVENT_ID0);
-
-                WaitFlag<HardEvent::MTE1_M>(EVENT_ID0);
-                MmadParams mmadParams;
-                mmadParams.m = 16;
-                mmadParams.n = 16;
-                mmadParams.k = 16;
-                mmadParams.cmatrixInitVal = (k == 0);
-                mmadParams.unitFlag = 0;
-                Mmad(l0C, l0A, l0B, mmadParams);
-                SetFlag<HardEvent::M_MTE1>(EVENT_ID0);
-            }
-
-            // Fixpipe: L0C → UB (Mqk result)
-            LocalTensor<half> Mqk_ub = ubBuf.GetBufferAddr<half>(UB_MQK_OFF);
-            SetFlag<HardEvent::M_FIX>(EVENT_ID0);
-            WaitFlag<HardEvent::M_FIX>(EVENT_ID0);
-            FixpipeParamsV220 fixpipeParams;
-            fixpipeParams.nSize = 16;
-            fixpipeParams.mSize = 16;
-            fixpipeParams.srcStride = 1;
-            fixpipeParams.dstStride = CHUNK;
-            fixpipeParams.quantPre = QuantMode_t::F322BF16;
-            fixpipeParams.reluEn = false;
-            fixpipeParams.unitFlag = 0;
-            Fixpipe<half, float, CFG_ROW_MAJOR>(Mqk_ub, l0C, fixpipeParams);
-            SetFlag<HardEvent::FIX_M>(EVENT_ID0);
-            WaitFlag<HardEvent::FIX_M>(EVENT_ID0);
-        }
-    }
-
-    // ============================================================
-    // AIC: Neumann inverse INV = (I - L)^{-1}
-    // ============================================================
-    // After tril_mask_aiv, INV_ub contains (I - L) and L_ub contains L.
-    // Neumann series:
-    //   L^2 = L × L
-    //   INV = (I-L) + (I-L) × L^2
-    //   L^4 = L^2 × L^2
-    //   INV += INV × L^4
-    //   L^8 = L^4 × L^4
-    //   INV += INV × L^8
-    //
-    // Each 16x16 MMAD: LoadData L1→L0A/L0B, Mmad, Fixpipe L0C→L1
-    // Between MMADs: copy L0C result to L1 for next iteration
-    __aicore__ void compute_neumann_inv_aic() {
-        // Copy L and (I-L) from UB → L1
-        // L is in UB_L_OFF as bf16 [16, 16]
-        // (I-L) is in UB_INV_OFF as bf16 [16, 16] (constructed by tril_mask_aiv)
-        // For MMAD, we need fp16 format in L1 zN
-
-        // UB → L1 copy (simple DataCopy, no fractal conversion for small 16x16)
-        // Note: For 16x16 matrices, the zN format in L1 is the same as RowMajor
-        // since 16 is one fractal block.
-        {
-            LocalTensor<half> L_ub = ubBuf.GetBufferAddr<half>(UB_L_OFF);
-            LocalTensor<half> L_l1 = l1Buf.GetBufferAddr<half>(L1_L_OFF);
-            DataCopy(L_l1, L_ub, CHUNK * CHUNK);
-        }
-        {
-            LocalTensor<half> INV_ub = ubBuf.GetBufferAddr<half>(UB_INV_OFF);
-            LocalTensor<half> INV_l1 = l1Buf.GetBufferAddr<half>(L1_INV_OFF);
-            DataCopy(INV_l1, INV_ub, CHUNK * CHUNK);
-        }
-
-        SetFlag<HardEvent::MTE2_MTE1>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_MTE1>(EVENT_ID0);
-
-        LoadData2DParams ldParamsA;
-        ldParamsA.startIndex = 0;
-        ldParamsA.repeatTimes = 1;
-        ldParamsA.srcStride = 1;
-        ldParamsA.sid = 0;
-        ldParamsA.dstGap = 0;
-        ldParamsA.ifTranspose = false;
-        ldParamsA.addrMode = 0;
-
-        LoadData2DParams ldParamsB;
-        ldParamsB.startIndex = 0;
-        ldParamsB.repeatTimes = 1;
-        ldParamsB.srcStride = 1;
-        ldParamsB.sid = 0;
-        ldParamsB.dstGap = 0;
-        ldParamsB.ifTranspose = true;  // transpose for B operand
-        ldParamsB.addrMode = 0;
-
-        MmadParams mmadParams;
-        mmadParams.m = 16;
-        mmadParams.n = 16;
-        mmadParams.k = 16;
-        mmadParams.unitFlag = 0;
-
-        // Helper lambda: MMAD C = A @ B^T, result stored to L1 dst_off
-        // Then copy L1 dst to L1 for next use
-        auto mmad_16x16 = [&](int l1_a_off, int l1_b_off, int l1_c_off, bool init) {
-            LocalTensor<half> l0A = l0ABuf.GetBufferAddr<half>(0);
-            LocalTensor<half> l0B = l0BBuf.GetBufferAddr<half>(0);
-            LocalTensor<float> l0C = l0CBuf.GetBufferAddr<float>(0);
-            LocalTensor<half> l1A = l1Buf.GetBufferAddr<half>(l1_a_off);
-            LocalTensor<half> l1B = l1Buf.GetBufferAddr<half>(l1_b_off);
-
-            WaitFlag<HardEvent::M_MTE1>(EVENT_ID0);
-            LoadData(l0A, l1A, ldParamsA);
-            LoadData(l0B, l1B, ldParamsB);
-            SetFlag<HardEvent::MTE1_M>(EVENT_ID0);
-
-            WaitFlag<HardEvent::MTE1_M>(EVENT_ID0);
-            mmadParams.cmatrixInitVal = init ? 1 : 0;
-            Mmad(l0C, l0A, l0B, mmadParams);
-            SetFlag<HardEvent::M_MTE1>(EVENT_ID0);
-
-            // Fixpipe: L0C → L1
-            SetFlag<HardEvent::M_FIX>(EVENT_ID0);
-            WaitFlag<HardEvent::M_FIX>(EVENT_ID0);
-            LocalTensor<half> l1C = l1Buf.GetBufferAddr<half>(l1_c_off);
-            FixpipeParamsV220 fixParams;
-            fixParams.nSize = 16;
-            fixParams.mSize = 16;
-            fixParams.srcStride = 1;
-            fixParams.dstStride = CHUNK;
-            fixParams.quantPre = QuantMode_t::F322BF16;
-            fixParams.reluEn = false;
-            fixParams.unitFlag = 0;
-            Fixpipe<half, float, CFG_ROW_MAJOR>(l1C, l0C, fixParams);
-            SetFlag<HardEvent::FIX_M>(EVENT_ID0);
-            WaitFlag<HardEvent::FIX_M>(EVENT_ID0);
-        };
-
-        // Step 1: L^2 = L × L
-        mmad_16x16(L1_L_OFF, L1_L_OFF, L1_LPOW_OFF, true);
-
-        // Step 2: INV = (I-L) + (I-L) × L^2
-        // tmp = (I-L) × L^2
-        mmad_16x16(L1_INV_OFF, L1_LPOW_OFF, L1_TMP_OFF, true);
-        // INV += tmp (element-wise add in L1)
-        // On AIC, element-wise add on L1 requires UB intermediate:
-        //   Copy INV and tmp to UB, Add, Copy back
-        // Or: use AIV for the add (requires CrossCore sync — expensive)
-        // Alternative: fuse the add into the next MMAD by using bias
-        // For simplicity, do the add via UB:
-        {
-            LocalTensor<half> inv_l1 = l1Buf.GetBufferAddr<half>(L1_INV_OFF);
-            LocalTensor<half> tmp_l1 = l1Buf.GetBufferAddr<half>(L1_TMP_OFF);
-            LocalTensor<half> inv_ub = ubBuf.GetBufferAddr<half>(UB_INV_OFF);
-            LocalTensor<half> tmp_ub = ubBuf.GetBufferAddr<half>(UB_L_OFF);  // reuse L UB space
-            DataCopy(inv_ub, inv_l1, CHUNK * CHUNK);
-            DataCopy(tmp_ub, tmp_l1, CHUNK * CHUNK);
-            PipeBarrier<PIPE_V>();
-            Add(inv_ub, inv_ub, tmp_ub, CHUNK * CHUNK);
-            DataCopy(inv_l1, inv_ub, CHUNK * CHUNK);
-            PipeBarrier<PIPE_V>();
-        }
-
-        // Step 3: L^4 = L^2 × L^2
-        mmad_16x16(L1_LPOW_OFF, L1_LPOW_OFF, L1_LPOW_OFF, true);
-
-        // Step 4: INV += INV × L^4
-        mmad_16x16(L1_INV_OFF, L1_LPOW_OFF, L1_TMP_OFF, true);
-        {
-            LocalTensor<half> inv_l1 = l1Buf.GetBufferAddr<half>(L1_INV_OFF);
-            LocalTensor<half> tmp_l1 = l1Buf.GetBufferAddr<half>(L1_TMP_OFF);
-            LocalTensor<half> inv_ub = ubBuf.GetBufferAddr<half>(UB_INV_OFF);
-            LocalTensor<half> tmp_ub = ubBuf.GetBufferAddr<half>(UB_L_OFF);
-            DataCopy(inv_ub, inv_l1, CHUNK * CHUNK);
-            DataCopy(tmp_ub, tmp_l1, CHUNK * CHUNK);
-            PipeBarrier<PIPE_V>();
-            Add(inv_ub, inv_ub, tmp_ub, CHUNK * CHUNK);
-            DataCopy(inv_l1, inv_ub, CHUNK * CHUNK);
-            PipeBarrier<PIPE_V>();
-        }
-
-        // Step 5: L^8 = L^4 × L^4
-        mmad_16x16(L1_LPOW_OFF, L1_LPOW_OFF, L1_LPOW_OFF, true);
-
-        // Step 6: INV += INV × L^8
-        mmad_16x16(L1_INV_OFF, L1_LPOW_OFF, L1_TMP_OFF, true);
-        {
-            LocalTensor<half> inv_l1 = l1Buf.GetBufferAddr<half>(L1_INV_OFF);
-            LocalTensor<half> tmp_l1 = l1Buf.GetBufferAddr<half>(L1_TMP_OFF);
-            LocalTensor<half> inv_ub = ubBuf.GetBufferAddr<half>(UB_INV_OFF);
-            LocalTensor<half> tmp_ub = ubBuf.GetBufferAddr<half>(UB_L_OFF);
-            DataCopy(inv_ub, inv_l1, CHUNK * CHUNK);
-            DataCopy(tmp_ub, tmp_l1, CHUNK * CHUNK);
-            PipeBarrier<PIPE_V>();
-            Add(inv_ub, inv_ub, tmp_ub, CHUNK * CHUNK);
-            // Final INV result stays in UB for AIV to store
-            // No need to copy back to L1
-        }
-    }
-};
-
-// ============================================================
-// AIV entry point
-// ============================================================
-template <>
-__aicore__ void FwdPrepareKernel::operator()<AIV>(const FwdParams& params) {
-    pipe.InitBuffer(ubBuf, PIPE_V, 192 * 1024);
-
-    int linear_idx = GetBlockIdx();
-    int head_idx = linear_idx / params.total_tiles;
-    int global_tile_idx = linear_idx % params.total_tiles;
-
-    // Compute sequence info
-    int seq_idx = 0, local_t = 0;
-    int64_t bos = 0, eos = 0;
-    int tiles_before = 0;
-
-    if (params.is_varlen) {
-        for (int i = 0; i < params.N; i++) {
-            int64_t seq_start = 0, seq_end = 0;
-            {
-                GlobalTensor<int64_t> g_cu;
-                g_cu.SetGlobalBuffer(
-                    reinterpret_cast<__gm__ int64_t*>(params.cu_seqlens) + i, 1);
-                LocalTensor<int64_t> cu_tmp = ubBuf.GetBufferAddr<int64_t>(
-                    UB_MQK_OFF + UB_LM_SIZE);
-                DataCopy(cu_tmp, g_cu, 1);
-                PipeBarrier<PIPE_V>();
-                seq_start = cu_tmp.GetValue(0);
-
-                g_cu.SetGlobalBuffer(
-                    reinterpret_cast<__gm__ int64_t*>(params.cu_seqlens) + i + 1, 1);
-                DataCopy(cu_tmp, g_cu, 1);
-                PipeBarrier<PIPE_V>();
-                seq_end = cu_tmp.GetValue(0);
-            }
-
-            int slen = int(seq_end - seq_start);
-            int n_tiles = (slen + CHUNK - 1) / CHUNK;
-            if (tiles_before + n_tiles > global_tile_idx) {
-                seq_idx = i;
-                bos = seq_start;
-                eos = seq_end;
-                break;
-            }
-            tiles_before += n_tiles;
-        }
-        local_t = global_tile_idx - tiles_before;
-    } else {
-        int T_seq = params.T_total / params.N;
-        int tiles_per_seq = (T_seq + CHUNK - 1) / CHUNK;
-        seq_idx = global_tile_idx / tiles_per_seq;
-        tiles_before = seq_idx * tiles_per_seq;
-        local_t = global_tile_idx - tiles_before;
-        bos = (int64_t)seq_idx * T_seq;
-        eos = bos + T_seq;
-    }
-
-    int seq_len = int(eos - bos);
-    int t_tiles_this_seq = (seq_len + CHUNK - 1) / CHUNK;
-    if (local_t >= t_tiles_this_seq) return;
-    int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
-
-    // Phase 1: Load inputs
-    load_inputs_aiv(params, head_idx, bos, local_t);
-
-    // Phase 2: L2 normalize q and k
-    l2_normalize_aiv();
-
-    // Phase 3: Gate activation + cumulative sum
-    gate_activation_cumsum_aiv(params, head_idx, actual_len);
-
-    // Phase 4: Decay application
-    decay_apply_aiv(params.scale);
-
-    // Phase 5: Store workspace (k_decayed, q_decayed, k_restored, g_total)
-    int ws_idx = head_idx * params.total_tiles + global_tile_idx;
-    store_workspace_aiv(params, ws_idx);
-
-    // Signal AIC: element-wise done, workspace in GM
-    CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady);
-
-    // Wait for AIC: L and Mqk computed
-    CrossCoreWaitFlag(mmaReady);
-
-    // Phase 6: Apply tril mask + beta sigmoid + construct (I-L)
-    int64_t t_offset = bos + local_t * CHUNK;
-    tril_mask_aiv(params, head_idx, t_offset);
-
-    // Signal AIC: (I-L) ready for Neumann inverse
-    CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady);
-
-    // Wait for AIC: INV computed
-    CrossCoreWaitFlag(mmaReady);
-
-    // Phase 8: Store INV and Mqk to workspace
+    // Tile -> (sequence, local chunk). Varlen sequences sit back to back, each
+    // padded to a whole number of chunks, so this is not a plain division.
+    CATLASS_DEVICE
+    void ResolveTile(Params const& params, int tileIdx, TileSpan& span)
     {
-        int64_t ws_base = (int64_t)ws_idx * WorkspaceSizes::kPerTile;
+        span.valid = false;
+        span.wsTile = 0;
+        span.tokenBase = 0;
+        span.actualLen = 0;
 
-        LocalTensor<half> inv_src = ubBuf.GetBufferAddr<half>(UB_INV_OFF);
-        GlobalTensor<half> inv_dst;
-        inv_dst.SetGlobalBuffer(
-            reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kINV),
-            CHUNK * CHUNK);
-        DataCopy(inv_dst, inv_src, CHUNK * CHUNK);
+        int64_t bos = 0;
+        int seqLen = 0;
+        int localTile = 0;
 
-        LocalTensor<half> mqk_src = ubBuf.GetBufferAddr<half>(UB_MQK_OFF);
-        GlobalTensor<half> mqk_dst;
-        mqk_dst.SetGlobalBuffer(
-            reinterpret_cast<__gm__ half*>(params.workspace + ws_base + WorkspaceOffsets::kMqk),
-            CHUNK * CHUNK);
-        DataCopy(mqk_dst, mqk_src, CHUNK * CHUNK);
+        if (params.is_varlen == 0) {
+            seqLen = params.T_total / params.N;
+            const int tilesPerSeq = (seqLen + CHUNK - 1) / CHUNK;
+            if (tilesPerSeq == 0) {
+                return;
+            }
+            const int seqIdx = tileIdx / tilesPerSeq;
+            if (seqIdx >= params.N) {
+                return;
+            }
+            localTile = tileIdx % tilesPerSeq;
+            bos = static_cast<int64_t>(seqIdx) * seqLen;
+        } else {
+            // A single int64 DataCopy is below the 32-byte granularity, so read
+            // cu_seqlens with scalar GM loads instead.
+            AscendC::GlobalTensor<int64_t> gmCu;
+            gmCu.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(params.cu_seqlens));
+            int consumed = 0;
+            bool found = false;
+            for (int s = 0; s < params.N; ++s) {
+                const int64_t start = gmCu.GetValue(s);
+                const int len = static_cast<int>(gmCu.GetValue(s + 1) - start);
+                const int tiles = (len + CHUNK - 1) / CHUNK;
+                if (tileIdx < consumed + tiles) {
+                    localTile = tileIdx - consumed;
+                    bos = start;
+                    seqLen = len;
+                    found = true;
+                    break;
+                }
+                consumed += tiles;
+            }
+            if (!found) {
+                return;
+            }
+        }
 
-        PipeBarrier<PIPE_V>();
+        const int rowStart = localTile * CHUNK;
+        if (rowStart >= seqLen) {
+            return;
+        }
+        int len = seqLen - rowStart;
+        if (len > CHUNK) {
+            len = CHUNK;
+        }
+
+        span.valid = true;
+        span.actualLen = len;
+        span.tokenBase = bos + rowStart;
+        span.wsTile = static_cast<int64_t>(tileIdx) * params.H * WorkspaceSizes::kPerTile;
     }
-}
 
-// ============================================================
-// AIC entry point
-// ============================================================
-template <>
-__aicore__ void FwdPrepareKernel::operator()<AIC>(const FwdParams& params) {
-    // Initialize buffers
-    pipe.InitBuffer(l1Buf, PIPE_MTE1, L1_SIZE);
-    pipe.InitBuffer(l0ABuf, PIPE_M, L0A_SIZE);
-    pipe.InitBuffer(l0BBuf, PIPE_M, L0B_SIZE);
-    pipe.InitBuffer(l0CBuf, PIPE_M, L0C_SIZE);
+    CATLASS_DEVICE
+    int64_t Ws(TileSpan const& span, int headIdx, uint32_t field) const
+    {
+        return span.wsTile + static_cast<int64_t>(headIdx) * WorkspaceSizes::kPerTile + field;
+    }
 
-    // Set workspace index (same as AIV)
-    int linear_idx = GetBlockIdx();
-    int head_idx = linear_idx / params.total_tiles;
-    int global_tile_idx = linear_idx % params.total_tiles;
-    ws_idx_ = head_idx * params.total_tiles + global_tile_idx;
+    CATLASS_DEVICE
+    int64_t Slot(TileSpan const& span, int headIdx, int i) const
+    {
+        return Ws(span, headIdx, WorkspaceOffsets::kScratch) +
+               static_cast<int64_t>(i) * WorkspaceSizes::kScratchSlot;
+    }
 
-    // Initialize HardEvent flags
-    SetFlag<HardEvent::M_MTE1>(EVENT_ID0);
-    SetFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
-    SetFlag<HardEvent::M_FIX>(EVENT_ID0);
-    SetFlag<HardEvent::FIX_M>(EVENT_ID0);
+    // ---------------- AIV round 1 ----------------
+    CATLASS_DEVICE
+    void Prepare(Params const& params, int headIdx, TileSpan const& span)
+    {
+        auto qb = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kQ);
+        auto kb = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kK);
+        auto gb = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kG);
+        auto qf = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kQf);
+        auto kf = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kKf);
+        auto gc = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kGc);
+        auto tmp = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kTmp);
+        auto tmp2 = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kTmp2);
+        auto gtot = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kGTotal);
+        auto dtb = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kDtBias);
 
-    // Wait for AIV: element-wise done, workspace in GM
-    CrossCoreWaitFlag(elemReady);
+        AscendC::GlobalTensor<BF16> gmQ, gmK, gmG;
+        gmQ.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.q));
+        gmK.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.k));
+        gmG.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.g));
 
-    // Phase 6: Compute L and Mqk via MMAD
-    compute_l_mqk_aic(params);
+        AscendC::Duplicate(qb, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::Duplicate(kb, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::Duplicate(gb, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((event_t)0);
 
-    // Signal AIV: L and Mqk ready in UB
-    CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady);
+        for (int r = 0; r < span.actualLen; ++r) {
+            const int64_t off = (span.tokenBase + r) * params.H * D +
+                                static_cast<int64_t>(headIdx) * D;
+            AscendC::DataCopy(qb[r * D], gmQ[off], D);
+            AscendC::DataCopy(kb[r * D], gmK[off], D);
+            AscendC::DataCopy(gb[r * D], gmG[off], D);
+        }
 
-    // Wait for AIV: (I-L) constructed in UB
-    CrossCoreWaitFlag(elemReady);
+        AscendC::GlobalTensor<float> gmDt;
+        gmDt.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.dt_bias));
+        AscendC::DataCopy(dtb, gmDt[static_cast<int64_t>(headIdx) * D], D);
 
-    // Phase 7: Neumann inverse
-    compute_neumann_inv_aic();
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)0);
 
-    // Signal AIV: INV ready in UB
-    CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady);
+        AscendC::Cast(qf, qb, AscendC::RoundMode::CAST_NONE, CHUNK * D);
+        AscendC::Cast(kf, kb, AscendC::RoundMode::CAST_NONE, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
 
-    // Release HardEvent flags
-    WaitFlag<HardEvent::M_MTE1>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE1_MTE2>(EVENT_ID0);
-    WaitFlag<HardEvent::M_FIX>(EVENT_ID0);
-    WaitFlag<HardEvent::FIX_M>(EVENT_ID0);
-}
+        // L2 normalize in fp32 and round once on the way out, as CUDA does.
+        for (int r = 0; r < span.actualLen; ++r) {
+            NormalizeRow(qf, tmp, r);
+            NormalizeRow(kf, tmp, r);
+        }
+
+        AscendC::GlobalTensor<float> gmALog;
+        gmALog.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.A_log));
+        const float aExp = ExpViaVector(gmALog.GetValue(headIdx));
+
+        // Gate activation, then an inclusive cumsum down the rows. Rows past
+        // the tail contribute nothing, which is what lets kernel 2 skip tail
+        // masking entirely.
+        AscendC::Duplicate(gtot, 0.0f, D);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (int r = 0; r < CHUNK; ++r) {
+            if (r < span.actualLen) {
+                AscendC::Cast(tmp, gb[r * D], AscendC::RoundMode::CAST_NONE, D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Add(tmp, tmp, dtb, D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(tmp, tmp, aExp, D);
+                AscendC::PipeBarrier<PIPE_V>();
+                Sigmoid(tmp, tmp2, D);
+                AscendC::Muls(tmp, tmp, params.gate_scale, D);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Add(gtot, gtot, tmp, D);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Adds(gc[r * D], gtot, 0.0f, D);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
+        // g_total is stored already exponentiated, as in CUDA; kernel 2 must
+        // not exponentiate it a second time.
+        AscendC::Exp(gtot, gtot, D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        Decay(params, span, qf, kf, gc, tmp, gtot);
+        Store(params, headIdx, span);
+    }
+
+    // The aicore has no scalar exp, so a one-off exponential has to be staged
+    // through UB and run on the vector unit. One datablock (8 floats) is the
+    // minimum useful width.
+    CATLASS_DEVICE
+    float ExpViaVector(float x)
+    {
+        auto pad = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kScalar);
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)2);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)2);
+        AscendC::Duplicate(pad, x, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Exp(pad, pad, 8);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)2);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)2);
+        return pad.GetValue(0);
+    }
+
+    CATLASS_DEVICE
+    void NormalizeRow(AscendC::LocalTensor<float> mat, AscendC::LocalTensor<float> tmp, int r)
+    {
+        auto work = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kReduce);
+        auto sc = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kScalar);
+
+        AscendC::Mul(tmp, mat[r * D], mat[r * D], D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ReduceSum<float>(sc, tmp, work, D);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)0);
+        const float inv = 1.0f / sqrt(sc.GetValue(0) + 1e-6f);
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)1);
+        AscendC::Muls(mat[r * D], mat[r * D], inv, D);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // sigmoid(x) = 1/(1+exp(-x)), using scratch to avoid an in-place Div.
+    CATLASS_DEVICE
+    void Sigmoid(AscendC::LocalTensor<float> x, AscendC::LocalTensor<float> scratch, int n)
+    {
+        AscendC::Muls(scratch, x, -1.0f, n);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Exp(scratch, scratch, n);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(scratch, scratch, 1.0f, n);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(x, 1.0f, n);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Div(x, x, scratch, n);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    CATLASS_DEVICE
+    void Decay(Params const& params, TileSpan const& span,
+               AscendC::LocalTensor<float> qf, AscendC::LocalTensor<float> kf,
+               AscendC::LocalTensor<float> gc, AscendC::LocalTensor<float> tmp,
+               AscendC::LocalTensor<float> gtot)
+    {
+        auto kdec = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kKDec);
+        auto qdec = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kQDec);
+        auto kinv = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kKInv);
+        auto kres = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kKRes);
+
+        AscendC::Duplicate(kdec, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::Duplicate(qdec, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::Duplicate(kinv, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::Duplicate(kres, static_cast<BF16>(0.0f), CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        for (int r = 0; r < span.actualLen; ++r) {
+            const int off = r * D;
+
+            AscendC::Exp(tmp, gc[off], D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(tmp, tmp, kf[off], D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(kdec[off], tmp, AscendC::RoundMode::CAST_RINT, D);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Exp(tmp, gc[off], D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(tmp, tmp, qf[off], D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(tmp, tmp, params.scale, D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(qdec[off], tmp, AscendC::RoundMode::CAST_RINT, D);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Muls(tmp, gc[off], -1.0f, D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp(tmp, tmp, D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(tmp, tmp, kf[off], D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(kinv[off], tmp, AscendC::RoundMode::CAST_RINT, D);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Mul(tmp, tmp, gtot, D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(kres[off], tmp, AscendC::RoundMode::CAST_RINT, D);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+    CATLASS_DEVICE
+    void Store(Params const& params, int headIdx, TileSpan const& span)
+    {
+        AscendC::GlobalTensor<BF16> wsB;
+        AscendC::GlobalTensor<float> wsF;
+        wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+        wsF.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+
+        auto kdec = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kKDec);
+        auto qdec = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kQDec);
+        auto kinv = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kKInv);
+        auto kres = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kKRes);
+        auto gtot = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kGTotal);
+        auto ident = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kSmallA);
+
+        // The identity the AIC seeds L0C with during the Neumann iteration.
+        // Building it here costs one tile's worth of scalar stores and saves a
+        // cross-core round trip per factor.
+        AscendC::Duplicate(ident, static_cast<BF16>(0.0f), CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)1);
+        for (int i = 0; i < CHUNK; ++i) {
+            ident.SetValue(i * CHUNK + i, static_cast<BF16>(1.0f));
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>((event_t)1);
+
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
+
+        AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kKDecayed) / 2], kdec, CHUNK * D);
+        AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kQDecayed) / 2], qdec, CHUNK * D);
+        AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kKInv) / 2], kinv, CHUNK * D);
+        AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kKRestored) / 2], kres, CHUNK * D);
+        AscendC::DataCopy(wsF[Ws(span, headIdx, WorkspaceOffsets::kGTotal) / 4], gtot, D);
+        AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kIdentity) / 2], ident, CHUNK * CHUNK);
+    }
+
+    // ---------------- AIV round 2: mask, beta, (I - L) ----------------
+    CATLASS_DEVICE
+    void MaskAndBuild(Params const& params, int headIdx, TileSpan const& span)
+    {
+        auto lf = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kLf);
+        auto mf = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kMqkF);
+        auto sa = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kSmallA);
+        auto sb = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kSmallB);
+
+        AscendC::GlobalTensor<float> wsF;
+        AscendC::GlobalTensor<BF16> wsB;
+        wsF.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+        wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+
+        AscendC::DataCopy(lf, wsF[Slot(span, headIdx, 0) / 4], CHUNK * CHUNK);
+        AscendC::DataCopy(mf, wsF[Slot(span, headIdx, 1) / 4], CHUNK * CHUNK);
+
+        AscendC::GlobalTensor<BF16> gmBeta;
+        gmBeta.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.beta));
+        const int64_t betaOff = static_cast<int64_t>(headIdx) * params.T_total + span.tokenBase;
+
+        // sigmoid(beta) for all 16 rows at once. Two hardware constraints shape
+        // this: the aicore has no scalar exp intrinsic, and the backend rejects
+        // scalar bf16 <-> float casts outright. So beta is loaded as a vector
+        // and converted with Cast on the vector unit, never element by element.
+        auto bsig = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kTmp);
+        auto bwrk = resource_.ubBuf.template GetBufferByByte<float>(K1Ub::kTmp2);
+        auto braw = resource_.ubBuf.template GetBufferByByte<BF16>(K1Ub::kScalar);
+
+        AscendC::Duplicate(braw, static_cast<BF16>(0), CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>((event_t)3);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((event_t)3);
+
+        AscendC::DataCopyExtParams bp{1, static_cast<uint32_t>(span.actualLen * 2), 0, 0, 0};
+        AscendC::DataCopyPadExtParams<BF16> bpad{false, 0, 0, static_cast<BF16>(0)};
+        AscendC::DataCopyPad(braw, gmBeta[betaOff], bp, bpad);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
+        AscendC::Cast(bsig, braw, AscendC::RoundMode::CAST_NONE, CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sigmoid(bsig, bwrk, CHUNK);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)4);
+
+        // Mask exactly as fwd_kernel1.cuh:476-492:
+        //   L   : i <= j -> 0 (diagonal included); i > j -> L * sigmoid(beta[i])
+        //   INV : i == j -> 1; i < j -> 0; i > j -> -L_masked
+        //   Mqk : i < j -> 0 (diagonal kept)
+        // Masks are built in fp32 scalars, in place, then converted to bf16 in
+        // one vector Cast each -- scalar bf16 casts are not representable.
+        for (int i = 0; i < CHUNK; ++i) {
+            const float bs = (i < span.actualLen) ? bsig.GetValue(i) : 0.0f;
+            for (int j = 0; j < CHUNK; ++j) {
+                float v;
+                if (i == j) {
+                    v = 1.0f;
+                } else if (i < j) {
+                    v = 0.0f;
+                } else {
+                    v = -(lf.GetValue(i * CHUNK + j) * bs);
+                }
+                lf.SetValue(i * CHUNK + j, v);
+                if (i < j) {
+                    mf.SetValue(i * CHUNK + j, 0.0f);
+                }
+            }
+        }
+
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)4);
+        AscendC::Cast(sa, lf, AscendC::RoundMode::CAST_RINT, CHUNK * CHUNK);
+        AscendC::Cast(sb, mf, AscendC::RoundMode::CAST_RINT, CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
+
+        // (I - L) into slot 0 for the AIC; Mqk is final.
+        AscendC::DataCopy(wsB[Slot(span, headIdx, 0) / 2], sa, CHUNK * CHUNK);
+        AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kMqk) / 2], sb, CHUNK * CHUNK);
+    }
+
+    // ---------------- AIC round 1 ----------------
+    // L = k_dec @ k_inv^T and Mqk = q_dec @ k_inv^T, both [16,128]x[128,16].
+    // k_inv is RowMajor [16,128] in GM; the same bytes read as ColumnMajor
+    // [128,16] are k_inv^T, so the transpose is a different Nd2Nz
+    // parameterization rather than any data movement. The draft set
+    // ifTranspose on a zN source, for which catlass has no path.
+    CATLASS_DEVICE
+    void ComputeLAndMqk(Params const& params, int headIdx, TileSpan const& span)
+    {
+        LoadBt(params, Ws(span, headIdx, WorkspaceOffsets::kKInv));
+        Gemm128(params, Ws(span, headIdx, WorkspaceOffsets::kKDecayed), Slot(span, headIdx, 0));
+        Gemm128(params, Ws(span, headIdx, WorkspaceOffsets::kQDecayed), Slot(span, headIdx, 1));
+    }
+
+    // GM RowMajor [16,128] -> L1 nZ [128,16]: the transposed B operand.
+    CATLASS_DEVICE
+    void LoadBt(Params const& params, int64_t gmByte)
+    {
+        AscendC::GlobalTensor<BF16> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+        auto l1B = resource_.l1Buf.template GetBufferByByte<BF16>(K1L1::kB);
+
+        AscendC::Nd2NzParams p;
+        p.ndNum = 1;
+        p.nValue = D;
+        p.dValue = CHUNK;
+        p.srcNdMatrixStride = 0;
+        p.srcDValue = D;
+        p.dstNzC0Stride = D;
+        p.dstNzNStride = 1;
+        p.dstNzMatrixStride = 0;
+        AscendC::DataCopy(l1B, gm[gmByte / 2], p);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
+    }
+
+    // One [16,128]x[128,16] MMAD; fp32 result to GM. n=16 k=128 fits L0 easily.
+    CATLASS_DEVICE
+    void Gemm128(Params const& params, int64_t aByte, int64_t dstByte)
+    {
+        AscendC::GlobalTensor<BF16> gm;
+        AscendC::GlobalTensor<float> out;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+        out.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+
+        auto l1A = resource_.l1Buf.template GetBufferByByte<BF16>(K1L1::kA);
+        auto l1B = resource_.l1Buf.template GetBufferByByte<BF16>(K1L1::kB);
+        auto l0A = resource_.l0ABuf.template GetBufferByByte<BF16>(0);
+        auto l0B = resource_.l0BBuf.template GetBufferByByte<BF16>(0);
+        auto l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+
+        AscendC::Nd2NzParams p;
+        p.ndNum = 1;
+        p.nValue = CHUNK;
+        p.dValue = D;
+        p.srcNdMatrixStride = 0;
+        p.srcDValue = D;
+        p.dstNzC0Stride = CHUNK;
+        p.dstNzNStride = 1;
+        p.dstNzMatrixStride = 0;
+        AscendC::DataCopy(l1A, gm[aByte / 2], p);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = (CHUNK / 16) * (D / 16);
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = false;
+        AscendC::LoadData(l0A, l1A, ld);
+        AscendC::LoadData(l0B, l1B, ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)0);
+
+        AscendC::MmadParams mp;
+        mp.m = CHUNK;
+        mp.n = CHUNK;
+        mp.k = D;
+        mp.cmatrixInitVal = true;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)0);
+
+        AscendC::FixpipeParamsV220 fp;
+        fp.nSize = CHUNK;
+        fp.mSize = CHUNK;
+        fp.srcStride = CHUNK;
+        fp.dstStride = CHUNK;
+        fp.quantPre = QuantMode_t::NoQuant;
+        AscendC::Fixpipe<float, float, AscendC::CFG_ROW_MAJOR>(out[dstByte / 4], l0C, fp);
+
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)0);
+    }
+
+    // ---------------- AIC round 2: Neumann inverse ----------------
+    // The AIV left A = (I - L) in slot 0, with L strictly lower triangular so
+    // L^16 = 0 and
+    //     (I + L)^{-1} = sum (-L)^k = (I - L)(I + L^2)(I + L^4)(I + L^8),
+    // the decomposition the CUDA kernel uses.
+    //
+    // Each factor is applied as P(I + X) = P + P*X: one MMAD seeds L0C from P
+    // against an identity, a second accumulates P*X with cmatrixInitVal =
+    // false, and Fixpipe's F322BF16 rounds on the way out. That keeps the whole
+    // iteration on the cube -- the draft tried to do the additions with vector
+    // Add on the AIC, which has no vector unit.
+    //
+    // Squaring is sign-safe: (I - L) carries -L below the diagonal and
+    // (-L)^2 = L^2, so squaring slot 0's strictly-lower part gives L^2.
+    CATLASS_DEVICE
+    void ComputeNeumann(Params const& params, int headIdx, TileSpan const& span)
+    {
+        const int64_t a = Slot(span, headIdx, 0);   // (I - L)
+        const int64_t l = Slot(span, headIdx, 2);   // L^(2^j)
+        const int64_t t = Slot(span, headIdx, 3);   // temp
+        const int64_t p = Slot(span, headIdx, 4);   // running product
+        const int64_t ident = Ws(span, headIdx, WorkspaceOffsets::kIdentity);
+
+        Gemm16(params, a, a, l, true, true);        // L^2
+        Gemm16(params, a, ident, p, true, true);    // P <- (I - L)
+
+        for (int j = 0; j < 3; ++j) {
+            Gemm16(params, p, ident, t, true, true);   // T <- P
+            Gemm16(params, p, l, t, false, true);      // T <- P + P*L^(2^(j+1))
+            Gemm16(params, t, ident, p, true, true);   // P <- T
+            if (j < 2) {
+                Gemm16(params, l, l, t, true, true);   // L <- L^2
+                Gemm16(params, t, ident, l, true, true);
+            }
+        }
+
+        // P is the inverse; publish it.
+        Gemm16(params, p, ident, Ws(span, headIdx, WorkspaceOffsets::kINV), true, true);
+    }
+
+    // 16x16x16 MMAD over bf16 GM scratch. bf16Out selects Fixpipe's F322BF16
+    // rounding so the result can feed the next MMAD without an AIV round-trip.
+    CATLASS_DEVICE
+    void Gemm16(Params const& params, int64_t aByte, int64_t bByte, int64_t dstByte,
+                bool init, bool bf16Out)
+    {
+        AscendC::GlobalTensor<BF16> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+
+        auto l1A = resource_.l1Buf.template GetBufferByByte<BF16>(K1L1::kSmallA);
+        auto l1B = resource_.l1Buf.template GetBufferByByte<BF16>(K1L1::kSmallB);
+        auto l0A = resource_.l0ABuf.template GetBufferByByte<BF16>(0);
+        auto l0B = resource_.l0BBuf.template GetBufferByByte<BF16>(0);
+        auto l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+
+        if (init) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+        }
+
+        AscendC::Nd2NzParams p;
+        p.ndNum = 1;
+        p.nValue = CHUNK;
+        p.dValue = CHUNK;
+        p.srcNdMatrixStride = 0;
+        p.srcDValue = CHUNK;
+        p.dstNzC0Stride = CHUNK;
+        p.dstNzNStride = 1;
+        p.dstNzMatrixStride = 0;
+        AscendC::DataCopy(l1A, gm[aByte / 2], p);
+        AscendC::DataCopy(l1B, gm[bByte / 2], p);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = 1;
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = false;
+        AscendC::LoadData(l0A, l1A, ld);
+        AscendC::LoadData(l0B, l1B, ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        AscendC::MmadParams mp;
+        mp.m = CHUNK;
+        mp.n = CHUNK;
+        mp.k = CHUNK;
+        mp.cmatrixInitVal = init;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+
+        AscendC::FixpipeParamsV220 fp;
+        fp.nSize = CHUNK;
+        fp.mSize = CHUNK;
+        fp.srcStride = CHUNK;
+        fp.dstStride = CHUNK;
+        if (bf16Out) {
+            AscendC::GlobalTensor<BF16> out;
+            out.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+            fp.quantPre = QuantMode_t::F322BF16;
+            AscendC::Fixpipe<BF16, float, AscendC::CFG_ROW_MAJOR>(out[dstByte / 2], l0C, fp);
+        } else {
+            AscendC::GlobalTensor<float> out;
+            out.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+            fp.quantPre = QuantMode_t::NoQuant;
+            AscendC::Fixpipe<float, float, AscendC::CFG_ROW_MAJOR>(out[dstByte / 4], l0C, fp);
+        }
+
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)1);
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+    }
+
+    Catlass::Arch::Resource<ArchTag> resource_;
+    Catlass::Arch::CrossCoreFlag elemReady_{K1_ELEM_READY};
+    Catlass::Arch::CrossCoreFlag mmaReady_{K1_MMA_READY};
+};
 
 }  // namespace flash_kda

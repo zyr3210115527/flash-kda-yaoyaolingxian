@@ -69,14 +69,23 @@ struct WorkspaceSizes {
     static constexpr int kINV       = CHUNK * CHUNK * sizeof(BF16);  // 512
     static constexpr int kMqk       = CHUNK * CHUNK * sizeof(BF16);  // 512
 
+    // A 16x16 bf16 identity. The Neumann iteration applies P(I + X) as
+    // P + P*X, seeding L0C with one MMAD of P against this identity. Keeping
+    // it in the workspace is what lets the whole inverse stay on the cube --
+    // the AIC has no vector unit to add with.
+    static constexpr int kIdentity  = CHUNK * CHUNK * sizeof(BF16);  // 512
+
     // AIC <-> AIV scratch for the L / Neumann hand-off. Six 16x16 slots:
     // L, (I-L), L^2, L^4, L^8, and one spare accumulator.
-    static constexpr int kScratchSlot = CHUNK * CHUNK * sizeof(FP32);  // 1024
-    static constexpr int kNumScratch  = 6;
-    static constexpr int kScratch     = kScratchSlot * kNumScratch;    // 6144
+    // Kernel 2 stages every AIC<->AIV handoff through these slots, because A2
+    // has no L1<->UB path. The widest thing that crosses is the [D, D] state
+    // update in fp32, so every slot is sized for that.
+    static constexpr int kScratchSlot = D * D * sizeof(FP32);          // 65536
+    static constexpr int kNumScratch  = 9;
+    static constexpr int kScratch     = kScratchSlot * kNumScratch;
 
     static constexpr int64_t kPerTile =
-        kKDecayed + kQDecayed + kKInv + kKRestored + kGTotal + kINV + kMqk + kScratch;
+        kKDecayed + kQDecayed + kKInv + kKRestored + kGTotal + kINV + kMqk + kIdentity + kScratch;
 };
 
 struct WorkspaceOffsets {
@@ -87,7 +96,8 @@ struct WorkspaceOffsets {
     static constexpr int kGTotal    = kKRestored + WorkspaceSizes::kKRestored;
     static constexpr int kINV       = kGTotal + WorkspaceSizes::kGTotal;
     static constexpr int kMqk       = kINV + WorkspaceSizes::kINV;
-    static constexpr int kScratch   = kMqk + WorkspaceSizes::kMqk;
+    static constexpr int kIdentity  = kMqk + WorkspaceSizes::kMqk;
+    static constexpr int kScratch   = kIdentity + WorkspaceSizes::kIdentity;
 };
 
 // ============================================================
@@ -114,6 +124,10 @@ struct FwdParams {
     GM_ADDR final_state;
 
     GM_ADDR cu_seqlens;     // [N+1] int64, nullptr when not varlen
+
+    // Byte offset into `workspace` of the live [N, H, D, D] fp32 recurrent
+    // state that kernel 2 carries across chunks. Sits past the per-tile region.
+    int64_t state_ws_offset;
 
     // Scalars
     float scale;
