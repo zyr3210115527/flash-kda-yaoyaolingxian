@@ -184,6 +184,12 @@ struct FwdParams {
     int N;
     int total_tiles;
 
+    // Which chunk kernel2's phase kernels should process. Carried in params
+    // rather than as a second kernel argument so kernel2's entries have the
+    // same single-argument signature as kernel1's, which is the shape known to
+    // work on this hardware.
+    int chunk_idx;
+
     // Feature flags (runtime, not template specialization)
     int has_state_in;
     int has_state_out;

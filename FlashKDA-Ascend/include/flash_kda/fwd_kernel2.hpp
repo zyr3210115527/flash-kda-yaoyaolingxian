@@ -175,8 +175,9 @@ public:
     }
 
     CATLASS_DEVICE
-    void RunBuildU(Params const& params, int chunk)
+    void RunBuildU(Params const& params)
     {
+        const int chunk = params.chunk_idx;
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
@@ -196,8 +197,9 @@ public:
     }
 
     CATLASS_DEVICE
-    void RunPreGemms(Params const& params, int chunk)
+    void RunPreGemms(Params const& params)
     {
+        const int chunk = params.chunk_idx;
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
@@ -210,8 +212,9 @@ public:
     }
 
     CATLASS_DEVICE
-    void RunFinishOut(Params const& params, int chunk)
+    void RunFinishOut(Params const& params)
     {
+        const int chunk = params.chunk_idx;
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
@@ -231,8 +234,9 @@ public:
     }
 
     CATLASS_DEVICE
-    void RunPostGemms(Params const& params, int chunk)
+    void RunPostGemms(Params const& params)
     {
+        const int chunk = params.chunk_idx;
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
@@ -245,8 +249,9 @@ public:
     }
 
     CATLASS_DEVICE
-    void RunFinishChunk(Params const& params, int chunk)
+    void RunFinishChunk(Params const& params)
     {
+        const int chunk = params.chunk_idx;
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }

@@ -199,6 +199,7 @@ void fwd(
     params.has_state_out = has_state_out ? 1 : 0;
     params.state_fp32 = state_fp32 ? 1 : 0;
     params.is_varlen = is_varlen ? 1 : 0;
+    params.chunk_idx = 0;
     params.state_ws_offset = flash_kda::get_state_ws_offset(T_total, H, N_val);
 
     // Get ACL stream
