@@ -624,6 +624,11 @@ private:
         AscendC::DataCopy(gt, wsF[Ws(params, tileIdx, headIdx, WorkspaceOffsets::kGTotal) / 4], D);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
+        // g_total is read below with GetValue, i.e. by the scalar unit. MTE2_V
+        // orders the load against the vector unit only; the scalar unit needs
+        // its own MTE2_S or the first read can see stale UB.
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>((event_t)3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>((event_t)3);
 
         // State is [key, value]; the decay is per key row, so g_total broadcasts
         // down rows one at a time.
