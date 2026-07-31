@@ -66,7 +66,7 @@ struct K1Ub {
     static constexpr uint32_t kSmallA = kMqkF + CHUNK * CHUNK * 4;
     static constexpr uint32_t kSmallB = kSmallA + 512;
     static constexpr uint32_t kReduce = kSmallB + 512;
-    static constexpr uint32_t kScalar = kReduce + 1024;
+    static constexpr uint32_t kScalar = kReduce + 1024;   // 32 sums at 8-float stride, then scratch
     static constexpr uint32_t kEnd    = kScalar + 2048;
 };
 static_assert(K1Ub::kEnd < ArchTag::UB_SIZE, "kernel1 UB budget exceeded");
@@ -377,10 +377,7 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         // L2 normalize in fp32 and round once on the way out, as CUDA does.
-        for (int r = 0; r < span.actualLen; ++r) {
-            NormalizeRow(bufs, qf, tmp, r);
-            NormalizeRow(bufs, kf, tmp, r);
-        }
+        NormalizeAll(bufs, qf, kf, tmp, span.actualLen);
 
         AscendC::GlobalTensor<float> gmALog;
         gmALog.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.A_log));
@@ -436,20 +433,49 @@ private:
     }
 
     CATLASS_DEVICE
-    void NormalizeRow(K1AivBufs& bufs, AscendC::LocalTensor<float> mat, AscendC::LocalTensor<float> tmp, int r)
+    void NormalizeAll(K1AivBufs& bufs, AscendC::LocalTensor<float> qf,
+                      AscendC::LocalTensor<float> kf, AscendC::LocalTensor<float> tmp,
+                      int rows)
     {
+        // One scalar/vector round trip for the whole tile instead of one per
+        // row per tensor. The reduce and the scale are cheap; the V_S/S_V pair
+        // between them is not, and doing it 32 times per tile dominated
+        // kernel1's runtime.
         auto work = bufs.template Ub<float>(K1Ub::kReduce);
-        auto sc = bufs.template Ub<float>(K1Ub::kScalar);
+        auto sums = bufs.template Ub<float>(K1Ub::kScalar);
 
-        AscendC::Mul(tmp, mat[r * D], mat[r * D], D);
+        // Sums are 8 floats apart: ReduceSum's destination wants 32-byte
+        // alignment, so packing them 4 bytes apart would misalign odd entries.
+        constexpr int kStride = 8;
+
+        AscendC::Mul(tmp, qf, qf, CHUNK * D);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::ReduceSum<float>(sc, tmp, work, D);
+        for (int r = 0; r < rows; ++r) {
+            AscendC::ReduceSum<float>(sums[r * kStride], tmp[r * D], work, D);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Mul(tmp, kf, kf, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (int r = 0; r < rows; ++r) {
+            AscendC::ReduceSum<float>(sums[(CHUNK + r) * kStride], tmp[r * D], work, D);
+        }
+
         AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)0);
-        const float inv = 1.0f / sqrt(sc.GetValue(0) + 1e-6f);
+        float invq[CHUNK];
+        float invk[CHUNK];
+        for (int r = 0; r < rows; ++r) {
+            invq[r] = 1.0f / sqrt(sums.GetValue(r * kStride) + 1e-6f);
+            invk[r] = 1.0f / sqrt(sums.GetValue((CHUNK + r) * kStride) + 1e-6f);
+        }
         AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)1);
-        AscendC::Muls(mat[r * D], mat[r * D], inv, D);
+
+        for (int r = 0; r < rows; ++r) {
+            AscendC::Muls(qf[r * D], qf[r * D], invq[r], D);
+            AscendC::Muls(kf[r * D], kf[r * D], invk[r], D);
+        }
         AscendC::PipeBarrier<PIPE_V>();
     }
 
