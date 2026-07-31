@@ -29,7 +29,6 @@
 #include "flash_kda/utils.hpp"
 
 #include "catlass/arch/arch.hpp"
-#include "catlass/arch/resource.hpp"
 #include <type_traits>
 
 #include "kernel_operator.h"
@@ -61,6 +60,59 @@ struct K2L1 {
     static constexpr uint32_t kEnd   = kSmall + 512;
 };
 static_assert(K2L1::kEnd < ArchTag::L1_SIZE, "kernel2 L1 budget exceeded");
+
+
+// Explicit per-core-type buffers, constructed inside the phase that needs them.
+//
+// Catlass::Arch::Resource is deliberately not used: as a class member it is
+// built on every launch regardless of whether the phase does any work, and
+// kernel2 issues five launches per chunk. It also allocates UB unconditionally,
+// which an AIC core has no use for.
+struct K2AivBufs {
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ub;
+
+    CATLASS_DEVICE
+    K2AivBufs()
+    {
+        pipe.InitBuffer(ub, ArchTag::UB_SIZE);
+    }
+
+    template <class T>
+    CATLASS_DEVICE AscendC::LocalTensor<T> Ub(uint32_t byteOffset)
+    {
+        return ub.Get<uint8_t>()[byteOffset].template ReinterpretCast<T>();
+    }
+};
+
+struct K2AicBufs {
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::A1> l1;
+    AscendC::TBuf<AscendC::TPosition::A2> l0a;
+    AscendC::TBuf<AscendC::TPosition::B2> l0b;
+    AscendC::TBuf<AscendC::TPosition::CO1> l0c;
+
+    CATLASS_DEVICE
+    K2AicBufs()
+    {
+        pipe.InitBuffer(l1, ArchTag::L1_SIZE);
+        pipe.InitBuffer(l0a, ArchTag::L0A_SIZE);
+        pipe.InitBuffer(l0b, ArchTag::L0B_SIZE);
+        pipe.InitBuffer(l0c, ArchTag::L0C_SIZE);
+    }
+
+    template <class T>
+    CATLASS_DEVICE AscendC::LocalTensor<T> L1(uint32_t byteOffset)
+    {
+        return l1.Get<uint8_t>()[byteOffset].template ReinterpretCast<T>();
+    }
+    template <class T>
+    CATLASS_DEVICE AscendC::LocalTensor<T> L0A() { return l0a.Get<T>(); }
+    template <class T>
+    CATLASS_DEVICE AscendC::LocalTensor<T> L0B() { return l0b.Get<T>(); }
+    template <class T>
+    CATLASS_DEVICE AscendC::LocalTensor<T> L0C() { return l0c.Get<T>(); }
+};
 
 class FwdRecurrenceKernel {
 public:
@@ -117,7 +169,8 @@ public:
         }
         SeqSpan sp = Locate(params, true);
         if (sp.valid) {
-            InitState(params, sp.seqIdx, sp.headIdx);
+            K2AivBufs bufs;
+            InitState(bufs, params, sp.seqIdx, sp.headIdx);
         }
     }
 
@@ -138,7 +191,8 @@ public:
         if (len > CHUNK) {
             len = CHUNK;
         }
-        BuildU(params, sp.headIdx, sp.tileBase + chunk, sp.bos + chunk * CHUNK, len);
+        K2AivBufs bufs;
+        BuildU(bufs, params, sp.headIdx, sp.tileBase + chunk, sp.bos + chunk * CHUNK, len);
     }
 
     CATLASS_DEVICE
@@ -151,7 +205,8 @@ public:
         if (!sp.valid || chunk >= sp.nTiles) {
             return;
         }
-        PreGemms(params, sp.seqIdx, sp.headIdx, sp.tileBase + chunk);
+        K2AicBufs bufs;
+        PreGemms(bufs, params, sp.seqIdx, sp.headIdx, sp.tileBase + chunk);
     }
 
     CATLASS_DEVICE
@@ -171,7 +226,8 @@ public:
         if (len > CHUNK) {
             len = CHUNK;
         }
-        FinishOut(params, sp.headIdx, sp.tileBase + chunk, sp.bos + chunk * CHUNK, len);
+        K2AivBufs bufs;
+        FinishOut(bufs, params, sp.headIdx, sp.tileBase + chunk, sp.bos + chunk * CHUNK, len);
     }
 
     CATLASS_DEVICE
@@ -184,7 +240,8 @@ public:
         if (!sp.valid || chunk >= sp.nTiles) {
             return;
         }
-        PostGemms(params, sp.seqIdx, sp.headIdx, sp.tileBase + chunk);
+        K2AicBufs bufs;
+        PostGemms(bufs, params, sp.seqIdx, sp.headIdx, sp.tileBase + chunk);
     }
 
     CATLASS_DEVICE
@@ -205,8 +262,9 @@ public:
             len = CHUNK;
         }
         const int tileIdx = sp.tileBase + chunk;
-        StoreOut(params, sp.headIdx, tileIdx, sp.bos + chunk * CHUNK, len);
-        DecayState(params, sp.seqIdx, sp.headIdx, tileIdx);
+        K2AivBufs bufs;
+        StoreOut(bufs, params, sp.headIdx, tileIdx, sp.bos + chunk * CHUNK, len);
+        DecayState(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
     }
 
     CATLASS_DEVICE
@@ -223,7 +281,8 @@ public:
         }
         SeqSpan sp = Locate(params, true);
         if (sp.valid) {
-            StoreFinalState(params, sp.seqIdx, sp.headIdx);
+            K2AivBufs bufs;
+            StoreFinalState(bufs, params, sp.seqIdx, sp.headIdx);
         }
     }
 
@@ -282,7 +341,7 @@ private:
     // (D-1)-element gap, which is destination row r drawn from gm[:, r].
 
     template <class T>
-    CATLASS_DEVICE void StateGmToUbT(AscendC::LocalTensor<float> dst,
+    CATLASS_DEVICE void StateGmToUbT(K2AivBufs& bufs, AscendC::LocalTensor<float> dst,
                                      AscendC::GlobalTensor<T> gm, int64_t base)
     {
         AscendC::DataCopyExtParams p;
@@ -292,7 +351,7 @@ private:
         p.dstStride = 0;
         AscendC::DataCopyPadExtParams<T> pad{false, 0, 0, static_cast<T>(0)};
 
-        auto staging = resource_.ubBuf.template GetBufferByByte<T>(K2Ub::kStateB);
+        auto staging = bufs.template Ub<T>(K2Ub::kStateB);
         for (int r = 0; r < D; ++r) {
             AscendC::DataCopyPad(staging[r * D], gm[base + r], p, pad);
         }
@@ -310,7 +369,7 @@ private:
     }
 
     template <class T>
-    CATLASS_DEVICE void StateUbToGmT(AscendC::GlobalTensor<T> gm, int64_t base,
+    CATLASS_DEVICE void StateUbToGmT(K2AivBufs& bufs, AscendC::GlobalTensor<T> gm, int64_t base,
                                      AscendC::LocalTensor<T> src)
     {
         AscendC::DataCopyExtParams p;
@@ -324,9 +383,9 @@ private:
     }
 
     CATLASS_DEVICE
-    void InitState(Params const& params, int seqIdx, int headIdx)
+    void InitState(K2AivBufs& bufs, Params const& params, int seqIdx, int headIdx)
     {
-        auto sa = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kStateA);
+        auto sa = bufs.template Ub<float>(K2Ub::kStateA);
         AscendC::GlobalTensor<float> gmS;
         gmS.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
         const int64_t dst = StateOff(params, seqIdx, headIdx);
@@ -338,13 +397,13 @@ private:
                 gmIn.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.initial_state));
                 const int64_t src = (static_cast<int64_t>(seqIdx) * params.H + headIdx) * D * D;
                 // GM is [value, key]; sa is [key, value].
-                StateGmToUbT<float>(sa, gmIn, src);
+                StateGmToUbT<float>(bufs, sa, gmIn, src);
             } else {
                 AscendC::GlobalTensor<BF16> gmIn;
                 gmIn.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.initial_state));
                 const int64_t src = (static_cast<int64_t>(seqIdx) * params.H + headIdx) * D * D;
                 // GM is [value, key]; sa is [key, value].
-                StateGmToUbT<BF16>(sa, gmIn, src);
+                StateGmToUbT<BF16>(bufs, sa, gmIn, src);
             }
         } else {
             AscendC::Duplicate(sa, 0.0f, D * D);
@@ -360,9 +419,9 @@ private:
     // in one round. Here we only prepare v (and zero its tail rows) and the
     // bf16 copy of the state the cube will read.
     CATLASS_DEVICE
-    void BuildU(Params const& params, int headIdx, int tileIdx, int64_t tokenBase, int len)
+    void BuildU(K2AivBufs& bufs, Params const& params, int headIdx, int tileIdx, int64_t tokenBase, int len)
     {
-        auto vb = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kV);
+        auto vb = bufs.template Ub<BF16>(K2Ub::kV);
         AscendC::GlobalTensor<BF16> gmV;
         gmV.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.v));
 
@@ -384,18 +443,18 @@ private:
         wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
         AscendC::DataCopy(wsB[Slot(params, tileIdx, headIdx, 2) / 2], vb, CHUNK * D);
 
-        StateToBf16(params, tileIdx, headIdx);
+        StateToBf16(bufs, params, tileIdx, headIdx);
     }
 
     // The cube reads the state as bf16; the live copy is fp32 in GM.
     CATLASS_DEVICE
-    void StateToBf16(Params const& params, int tileIdx, int headIdx)
+    void StateToBf16(K2AivBufs& bufs, Params const& params, int tileIdx, int headIdx)
     {
         const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         const int seqIdx = static_cast<int>(coreIdx) / params.H;
 
-        auto sf = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kStateA);
-        auto sb = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kStateB);
+        auto sf = bufs.template Ub<float>(K2Ub::kStateA);
+        auto sb = bufs.template Ub<BF16>(K2Ub::kStateB);
         AscendC::GlobalTensor<float> gmS;
         AscendC::GlobalTensor<BF16> wsB;
         gmS.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
@@ -414,11 +473,11 @@ private:
     // u = slot4 - slot5, then out = slot6 (q_dec@state) + Mqk @ u needs another
     // GEMM, so u goes back out for round 2.
     CATLASS_DEVICE
-    void FinishOut(Params const& params, int headIdx, int tileIdx, int64_t tokenBase, int len)
+    void FinishOut(K2AivBufs& bufs, Params const& params, int headIdx, int tileIdx, int64_t tokenBase, int len)
     {
-        auto a = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kF32A);
-        auto b = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kF32B);
-        auto ub = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kU);
+        auto a = bufs.template Ub<float>(K2Ub::kF32A);
+        auto b = bufs.template Ub<float>(K2Ub::kF32B);
+        auto ub = bufs.template Ub<BF16>(K2Ub::kU);
 
         AscendC::GlobalTensor<float> wsF;
         AscendC::GlobalTensor<BF16> wsB;
@@ -445,11 +504,11 @@ private:
     // state = state * g_total + (k_res^T @ u), the latter left in slot 7 by the
     // cube in round 2 of the *previous* handshake half.
     CATLASS_DEVICE
-    void DecayState(Params const& params, int seqIdx, int headIdx, int tileIdx)
+    void DecayState(K2AivBufs& bufs, Params const& params, int seqIdx, int headIdx, int tileIdx)
     {
-        auto sf = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kStateA);
-        auto upd = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kStateB);
-        auto gt = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kGTotal);
+        auto sf = bufs.template Ub<float>(K2Ub::kStateA);
+        auto upd = bufs.template Ub<float>(K2Ub::kStateB);
+        auto gt = bufs.template Ub<float>(K2Ub::kGTotal);
 
         AscendC::GlobalTensor<float> gmS;
         AscendC::GlobalTensor<float> wsF;
@@ -487,11 +546,11 @@ private:
     // out = slot6 + slot8, both fp32 from the cube; rounded once to bf16 as the
     // reference does, and only real rows are written.
     CATLASS_DEVICE
-    void StoreOut(Params const& params, int headIdx, int tileIdx, int64_t tokenBase, int len)
+    void StoreOut(K2AivBufs& bufs, Params const& params, int headIdx, int tileIdx, int64_t tokenBase, int len)
     {
-        auto a = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kF32A);
-        auto b = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kF32B);
-        auto ob = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kU);
+        auto a = bufs.template Ub<float>(K2Ub::kF32A);
+        auto b = bufs.template Ub<float>(K2Ub::kF32B);
+        auto ob = bufs.template Ub<BF16>(K2Ub::kU);
 
         AscendC::GlobalTensor<float> wsF;
         AscendC::GlobalTensor<BF16> gmOut;
@@ -516,9 +575,9 @@ private:
     }
 
     CATLASS_DEVICE
-    void StoreFinalState(Params const& params, int seqIdx, int headIdx)
+    void StoreFinalState(K2AivBufs& bufs, Params const& params, int seqIdx, int headIdx)
     {
-        auto sf = resource_.ubBuf.template GetBufferByByte<float>(K2Ub::kStateA);
+        auto sf = bufs.template Ub<float>(K2Ub::kStateA);
         AscendC::GlobalTensor<float> gmS;
         gmS.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
         AscendC::DataCopy(sf, gmS[StateOff(params, seqIdx, headIdx) / 4], D * D);
@@ -532,23 +591,23 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             // sf is [key, value]; GM wants [value, key].
-            StateUbToGmT<float>(gmFs, dst, sf);
+            StateUbToGmT<float>(bufs, gmFs, dst, sf);
         } else {
-            auto sb = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kStateB);
+            auto sb = bufs.template Ub<BF16>(K2Ub::kStateB);
             AscendC::Cast(sb, sf, AscendC::RoundMode::CAST_RINT, D * D);
             AscendC::GlobalTensor<BF16> gmFs;
             gmFs.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.final_state));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             // sb is [key, value]; GM wants [value, key].
-            StateUbToGmT<BF16>(gmFs, dst, sb);
+            StateUbToGmT<BF16>(bufs, gmFs, dst, sb);
         }
     }
 
     // ---------------- AIC ----------------
     // Round 1: slot4 = Mqk @ v, slot5 = (INV @ k_dec) @ state, slot6 = q_dec @ state.
     CATLASS_DEVICE
-    void PreGemms(Params const& params, int seqIdx, int headIdx, int tileIdx)
+    void PreGemms(K2AicBufs& bufs, Params const& params, int seqIdx, int headIdx, int tileIdx)
     {
         const int64_t mqk = Ws(params, tileIdx, headIdx, WorkspaceOffsets::kMqk);
         const int64_t inv = Ws(params, tileIdx, headIdx, WorkspaceOffsets::kINV);
@@ -558,50 +617,50 @@ private:
         const int64_t state = Slot(params, tileIdx, headIdx, 3);
 
         // Mqk[16,16] @ v[16,128]
-        Gemm(params, mqk, v, Slot(params, tileIdx, headIdx, 4), CHUNK, D, CHUNK, false);
+        Gemm(bufs, params, mqk, v, Slot(params, tileIdx, headIdx, 4), CHUNK, D, CHUNK, false);
         // INV[16,16] @ k_dec[16,128] -> slot0 as bf16, then @ state[128,128]
-        Gemm(params, inv, kdec, Slot(params, tileIdx, headIdx, 0), CHUNK, D, CHUNK, true);
-        Gemm(params, Slot(params, tileIdx, headIdx, 0), state,
+        Gemm(bufs, params, inv, kdec, Slot(params, tileIdx, headIdx, 0), CHUNK, D, CHUNK, true);
+        Gemm(bufs, params, Slot(params, tileIdx, headIdx, 0), state,
              Slot(params, tileIdx, headIdx, 5), CHUNK, D, D, false);
         // q_dec[16,128] @ state[128,128]
-        Gemm(params, qdec, state, Slot(params, tileIdx, headIdx, 6), CHUNK, D, D, false);
+        Gemm(bufs, params, qdec, state, Slot(params, tileIdx, headIdx, 6), CHUNK, D, D, false);
         (void)seqIdx;
     }
 
     // Round 2: slot8 = Mqk @ u, slot7 = k_res^T @ u.
     CATLASS_DEVICE
-    void PostGemms(Params const& params, int seqIdx, int headIdx, int tileIdx)
+    void PostGemms(K2AicBufs& bufs, Params const& params, int seqIdx, int headIdx, int tileIdx)
     {
         const int64_t mqk = Ws(params, tileIdx, headIdx, WorkspaceOffsets::kMqk);
         const int64_t kres = Ws(params, tileIdx, headIdx, WorkspaceOffsets::kKRestored);
         const int64_t u = Slot(params, tileIdx, headIdx, 2);
 
-        Gemm(params, mqk, u, Slot(params, tileIdx, headIdx, 8), CHUNK, D, CHUNK, false);
+        Gemm(bufs, params, mqk, u, Slot(params, tileIdx, headIdx, 8), CHUNK, D, CHUNK, false);
         // k_res^T[128,16] @ u[16,128]: the transpose comes from reading k_res's
         // RowMajor bytes as ColumnMajor, not from any data movement.
-        GemmAt(params, kres, u, Slot(params, tileIdx, headIdx, 7));
+        GemmAt(bufs, params, kres, u, Slot(params, tileIdx, headIdx, 7));
         (void)seqIdx;
     }
 
     // C[m,n] = A[m,k] @ B[k,n], all operands bf16 in GM scratch.
     CATLASS_DEVICE
-    void Gemm(Params const& params, int64_t aByte, int64_t bByte, int64_t cByte,
+    void Gemm(K2AicBufs& bufs, Params const& params, int64_t aByte, int64_t bByte, int64_t cByte,
               int m, int n, int k, bool bf16Out)
     {
         AscendC::GlobalTensor<BF16> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
 
-        auto l1A = resource_.l1Buf.template GetBufferByByte<BF16>(K2L1::kA);
-        auto l1B = resource_.l1Buf.template GetBufferByByte<BF16>(K2L1::kState);
-        auto l0A = resource_.l0ABuf.template GetBufferByByte<BF16>(0);
-        auto l0B = resource_.l0BBuf.template GetBufferByByte<BF16>(0);
-        auto l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+        auto l1A = bufs.template L1<BF16>(K2L1::kA);
+        auto l1B = bufs.template L1<BF16>(K2L1::kState);
+        auto l0A = bufs.template L0A<BF16>();
+        auto l0B = bufs.template L0B<BF16>();
+        auto l0C = bufs.template L0C<float>();
 
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
 
-        LoadNd2Nz(l1A, gm, aByte, m, k);
-        LoadNd2Nz(l1B, gm, bByte, k, n);
+        LoadNd2Nz(bufs, l1A, gm, aByte, m, k);
+        LoadNd2Nz(bufs, l1B, gm, bByte, k, n);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
@@ -629,38 +688,45 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)0);
 
-        Drain(params, l0C, cByte, m, n, bf16Out);
+        Drain(bufs, params, l0C, cByte, m, n, bf16Out);
     }
 
     // C[128,128] = A^T[128,16] @ B[16,128], A stored RowMajor [16,128].
     CATLASS_DEVICE
-    void GemmAt(Params const& params, int64_t aByte, int64_t bByte, int64_t cByte)
+    void GemmAt(K2AicBufs& bufs, Params const& params, int64_t aByte, int64_t bByte, int64_t cByte)
     {
         AscendC::GlobalTensor<BF16> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
 
-        auto l1A = resource_.l1Buf.template GetBufferByByte<BF16>(K2L1::kA);
-        auto l1B = resource_.l1Buf.template GetBufferByByte<BF16>(K2L1::kB);
-        auto l0A = resource_.l0ABuf.template GetBufferByByte<BF16>(0);
-        auto l0B = resource_.l0BBuf.template GetBufferByByte<BF16>(0);
-        auto l0C = resource_.l0CBuf.template GetBufferByByte<float>(0);
+        auto l1A = bufs.template L1<BF16>(K2L1::kA);
+        auto l1B = bufs.template L1<BF16>(K2L1::kB);
+        auto l0A = bufs.template L0A<BF16>();
+        auto l0B = bufs.template L0B<BF16>();
+        auto l0C = bufs.template L0C<float>();
 
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)1);
 
-        // ColumnMajor view of the same bytes: nZ in L1, which is the layout
-        // LoadData's transposing A path expects.
+        // k_res is [CHUNK, D] RowMajor; its transpose is the same bytes viewed
+        // as ColumnMajor [D, CHUNK]. Nd2Nz describes a ColumnMajor source by
+        // its columns: nValue is the column count, dValue the column length,
+        // srcDValue the column pitch. The reversed form asks for D spans of
+        // CHUNK at a D pitch and runs off the end of a CHUNK*D buffer -- the
+        // same out-of-bounds read that faulted kernel1's LoadBt.
+        //
+        // For nZ [D, CHUNK]: stride(1) = colsRound * C0 = 256, stride(2) = 16,
+        // so dstNzC0Stride = 256/16 = CHUNK and dstNzNStride = 1.
         AscendC::Nd2NzParams p;
         p.ndNum = 1;
-        p.nValue = D;
-        p.dValue = CHUNK;
+        p.nValue = CHUNK;
+        p.dValue = D;
         p.srcNdMatrixStride = 0;
         p.srcDValue = D;
-        p.dstNzC0Stride = D;
+        p.dstNzC0Stride = CHUNK;
         p.dstNzNStride = 1;
         p.dstNzMatrixStride = 0;
         AscendC::DataCopy(l1A, gm[aByte / 2], p);
-        LoadNd2Nz(l1B, gm, bByte, CHUNK, D);
+        LoadNd2Nz(bufs, l1B, gm, bByte, CHUNK, D);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
@@ -694,11 +760,11 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
 
-        Drain(params, l0C, cByte, D, D, false);
+        Drain(bufs, params, l0C, cByte, D, D, false);
     }
 
     CATLASS_DEVICE
-    void LoadNd2Nz(AscendC::LocalTensor<BF16> dst, AscendC::GlobalTensor<BF16> src,
+    void LoadNd2Nz(K2AicBufs& bufs, AscendC::LocalTensor<BF16> dst, AscendC::GlobalTensor<BF16> src,
                    int64_t byteOff, int rows, int cols)
     {
         AscendC::Nd2NzParams p;
@@ -714,7 +780,7 @@ private:
     }
 
     CATLASS_DEVICE
-    void Drain(Params const& params, AscendC::LocalTensor<float> l0C, int64_t cByte,
+    void Drain(K2AicBufs& bufs, Params const& params, AscendC::LocalTensor<float> l0C, int64_t cByte,
                int m, int n, bool bf16Out)
     {
         AscendC::FixpipeParamsV220 fp;
@@ -738,8 +804,6 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)1);
     }
-
-    Catlass::Arch::Resource<ArchTag> resource_;
 };
 
 }  // namespace flash_kda
