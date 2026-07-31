@@ -3,14 +3,39 @@
 ## Where things stand
 
 Both kernels are **rewritten**, the extension **builds and links**, and it
-**launches on a real 910B3**. Kernel1 has been restructured to four
-single-core-type launches and its two AIV phases now **run correctly on device**.
-The two AIC (cube) phases still hang, so the forward pass does not complete end
-to end yet.
+**launches on a real 910B3**. Kernel1 is restructured into four single-core-type
+launches and its two AIV phases **run correctly on device**. The two AIC (cube)
+phases hang, so the forward pass does not complete end to end yet.
 
-An AIV-only probe kernel produced **numerically exact** output on the card
-(`exp(0)=1.000000`, `exp(1.27)=3.560853`), so the vector path, the workspace, the
-launch plumbing and the build are all genuinely working.
+An AIV-only probe returned **numerically exact** output on the card
+(`exp(0)=1.000000`, `exp(1.27)=3.560853`), so the vector path, workspace, launch
+plumbing and build are all genuinely working.
+
+The CPU-side oracle is now **verified**, which it never was before:
+`tests/validate_ref.py` checks torch_ref against an independently written
+unchunked float64 delta-rule loop and passes 5/5 (basic, tail chunk, state,
+varlen, plus the Neumann identity to 1e-14). It found and fixed a real NaN bug
+in torch_ref along the way. So when the kernel does run, the number it is
+measured against can be trusted.
+
+## Blocked on you: Teleport login
+
+The certificate expired at 04:08 on 2026-07-31, so `tsh ssh` and the Cybertron
+job API both return 401. Re-auth is SSO:
+
+```bash
+"$HOME/Library/Application Support/Cursor/User/globalStorage/yangsuiyun.cybertron/bin/tsh" login \
+  --proxy=teleport.cybertron.modelbest.co:443
+```
+
+Then create a devspace with the recipe in `docs/bringup.md`. The work on the
+card is under `/user/zhouyiran/flashkda` (JuiceFS) and survived the pod.
+
+Note also that macOS TCC intermittently blocks `~/Documents` for the shell, which
+breaks git there. Everything is pushed to GitHub, so a `git pull` in the local
+checkout is enough to catch up. If it recurs: System Settings → Privacy &
+Security → Files and Folders.
+
 
 ## The bug is in the cube path, and it is localized
 
@@ -125,6 +150,17 @@ probe completes.
 
 ### After that
 
+Once a card is back, in this order:
+
+1. **`tests/check_prepare.py`** — verifies kernel1's prepare output
+   (k_decayed, q_decayed, k_inv, k_restored, g_total) field by field against
+   float64 CPU expectations. Those AIV phases already run, so this should pass
+   immediately and confirms the gate, cumsum and decay math on hardware. Its
+   `--cpu-only` mode already passes.
+2. **`tests/aic_resource_probe.cpp`** — decides the Resource hypothesis.
+3. Whichever fix that implies, then `tests/test_npu_nocompute.py` for the first
+   end-to-end number against the reference.
+
 The durable cleanup remains replacing the hand-rolled `Nd2NzParams` /
 `LoadData2DParams` / `FixpipeParamsV220` in `Gemm128`, `Gemm16`, `LoadBt`
 (kernel1) and `Gemm`, `GemmAt`, `LoadNd2Nz` (kernel2) with the catlass tile
@@ -139,13 +175,26 @@ Build layouts with `layout::RowMajor(rows, cols)` and
 `examples/19_mla/mla_kernel.cpp`. This also deletes `utils.hpp`'s
 `ZnBlockOffsetBytes` / `Nd2NzC0Stride` / `Nd2NzNStride`.
 
-Kernel2 still uses cross-core handshakes and needs the same split treatment once
-kernel1's cube path runs. It is serial across chunks, so the chunk loop probably
-has to move to the host.
+**Kernel2 still uses cross-core handshakes and therefore cannot run at all.** It
+needs the same split kernel1 received. It is serial across chunks with two
+handshakes per chunk, so the chunk loop has to move to the host — roughly five
+launches per chunk. This was deliberately not attempted yet: kernel2 consumes
+kernel1's workspace, so it cannot be debugged until kernel1's cube path works,
+and stacking another large untested change would make it hard to tell which
+change broke what.
 
-Nothing has been validated numerically yet beyond the `aiv_only` probe. Once the
-forward pass completes, `tests/test_npu_nocompute.py` prints `err_ratio` against
-the CPU reference; bf16 end to end should land near 1e-2.
+Its state transpose at the GM boundary **is** done, since
+`validate_ref.py` check [4] specified it precisely.
+
+## Untested changes currently in the tree
+
+Two, both committed with reasoning but never compiled — the card expired first:
+
+- `K1AivBufs` / `K1AicBufs` replacing `Catlass::Arch::Resource` in kernel1.
+- The `StateGmToUbT` / `StateUbToGmT` boundary transpose in kernel2.
+
+If the first turns out wrong (stage A of the probe completes), revert it before
+debugging anything else.
 
 ## Diagnostics left in the tree
 
