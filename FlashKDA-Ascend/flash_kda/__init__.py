@@ -1,7 +1,10 @@
 """FlashKDA: Flash Kimi Delta Attention (Ascend NPU)"""
 
 import torch
-import torch_npu  # registers the npu device with torch
+try:  # registers the npu device; absent on a CPU-only host
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
 from flash_kda._C import fwd as _fwd_raw, get_workspace_size
 
 

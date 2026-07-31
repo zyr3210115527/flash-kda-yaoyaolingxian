@@ -10,7 +10,10 @@ No CUDA dependencies — works on CPU or NPU.
 """
 
 import torch
-import torch_npu  # registers the npu device with torch
+try:  # registers the npu device; absent on a CPU-only host
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
 import math
 
 # ============================================================
@@ -47,10 +50,15 @@ def matmul_fp16acc(a, b):
     On NPU: use torch.mm with out_dtype=torch.float16.
     On CPU: simulate fp16 accumulation by casting inputs to fp16 first.
     """
-    a_fp16 = a.to(torch.float16)
-    b_fp16 = b.to(torch.float16)
-    # torch.mm accumulates in the output dtype
-    return torch.mm(a_fp16, b_fp16)
+    # Do NOT cast the inputs to fp16. They are bf16 (8-bit exponent) and
+    # routinely exceed fp16's 65504 -- k_inv = k * ex2(-cumsum) reaches ~1e27
+    # for a 16-row chunk at lower_bound = -5 -- so casting inputs turns them
+    # into inf and the tile fills with NaN. The MMA being emulated takes bf16
+    # inputs and only the accumulator is fp16, so multiply at full range and
+    # round the result, which is where the accumulator's precision actually
+    # costs something.
+    out = torch.mm(a.to(torch.float32), b.to(torch.float32))
+    return out.to(torch.float16)
 
 
 def l2_normalize_kernel_match(x):
