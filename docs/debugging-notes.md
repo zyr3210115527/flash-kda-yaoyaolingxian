@@ -2,7 +2,7 @@
 
 ## Where things stand
 
-**Kernel1 works and is verified on hardware.** All four phases run clean, and
+**Kernel1 works and is verified on hardware.** All four phases run clean and
 every output is checked against float64 CPU expectations on a 910B3:
 
 ```
@@ -12,16 +12,45 @@ g_total    8.962e-07    Mqk        3.851e-03
 INV        1.047e-02
 ```
 
-It also holds at T=64, H=4 (16 cores), not just the single tile it was debugged
-on.
+It holds at T=64, H=4 (16 cores), not just the single tile it was debugged on.
 
-**The full forward pass runs end to end** — B=1 T=64 H=4 D=128 completes with
-finite, non-zero output, no hang and no aicore exception. Both kernels execute.
+**The full forward pass runs end to end.** Both kernels execute, output is
+finite and non-zero.
 
-**But kernel2 is numerically wrong**: `err_ratio = 9.999e-01` against torch_ref,
-i.e. the output is essentially uncorrelated with the reference rather than
-imprecise. Kernel1's outputs are all individually verified, so the fault is in
-kernel2's recurrence.
+**Kernel2 is not correct yet.** `err_ratio ~ 0.44` against torch_ref, where the
+bf16 floor is ~1e-2. And it is **non-deterministic**: repeated runs of the same
+binary on the same input give 4.3917e-01, 4.3926e-01, 4.3930e-01, and roughly
+one run in three or four produces no number at all. A deterministic kernel on
+fixed inputs must be bit-identical, so there is still a race.
+
+Getting from 1.0 to 0.44 came from correcting the recurrence; the remaining gap
+and the non-determinism are unresolved.
+
+## What to chase next, in order
+
+1. **The race.** Three things were fixed and none of them was it:
+   - `DataCacheCleanAndInvalid` on the six workspace stores that cross a phase
+     boundary. This *did* remove the intermittent aicore exceptions.
+   - The workspace was `torch.empty`; it is now zeroed.
+   - `DecayState` read `g_total` with `GetValue` (scalar unit) behind only an
+     `MTE2_V` barrier; it now also issues `MTE2_S`.
+
+   Still to examine: the AIV stores in `FinishOut` and `FinishChunk` against
+   their own MTE3 completion, and whether `Drain`'s Fixpipe targets need
+   flushing the way the AIV stores did. A useful experiment is to run with
+   `maxChunks` capped at 1 — if a single chunk is deterministic, the race is in
+   the chunk-to-chunk carry, which narrows it to the state in `DecayState`.
+
+2. **The B-operand layout.** `Gemm` and `GemmAt` load B as RowMajor→zN and issue
+   `ifTranspose = false`. L0B accepts only zZ (transposing) or nZ (not), so this
+   is a well-formed but wrong operand — plausibly most of the residual 0.44. The
+   full zZ parameterization is derived below. I implemented it once and it hung;
+   that was before the argument-shape fix, so it deserves a retry now that the
+   launch path is sound.
+
+3. **Then re-verify.** `tests/check_prepare.py` for kernel1, then
+   `tests/test_npu_nocompute.py` for the end-to-end number, then
+   `tests/validate_ref.py` stays the oracle.
 
 ## The next thing to fix
 
