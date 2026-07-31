@@ -53,6 +53,9 @@ struct K2Ub {
 static_assert(K2Ub::kEnd < ArchTag::UB_SIZE, "kernel2 UB budget exceeded");
 
 // L1 map, AIC only. Two [16,128] operands plus the [128,128] state.
+// Tight slots, deliberately. Widening these to 64 KB each made the cube fault,
+// so the fractal loads depend on this packing more than on having slack --
+// the opposite of what L0A/L0B/L0C wanted in kernel1.
 struct K2L1 {
     static constexpr uint32_t kA     = 0;
     static constexpr uint32_t kB     = kA + CHUNK * D * 2;
