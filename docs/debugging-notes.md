@@ -69,24 +69,63 @@ ColumnMajor view; the two `Gemm128` calls (removed and it still hangs).
 
 ## What to do next
 
-Start from the one failing call and nothing else. A standalone AIC kernel in the
-extension that does a single `Nd2Nz` GM→L1 `DataCopy` and then returns is a
-five-minute experiment and either reproduces the hang in isolation or shows the
-surrounding code matters.
+**First, get a card back.** The Teleport certificate expired at 04:08 on
+2026-07-31, so both `tsh ssh` and the Cybertron job API return 401. Re-auth is
+SSO and has to be done by you:
 
-Then compare that call against how catlass actually issues it. `CopyGmToL1`
-(`gemm/tile/atlasa2/copy_gm_to_l1.hpp`) is the reference; note that it derives
-every field from a layout object and that the L1 destination tensor comes from
-a buffer whose size it knows. Two things worth checking specifically:
+```bash
+"$HOME/Library/Application Support/Cursor/User/globalStorage/yangsuiyun.cybertron/bin/tsh" login \
+  --proxy=teleport.cybertron.modelbest.co:443
+```
 
-- Whether the L1 `LocalTensor` obtained via
-  `resource_.l1Buf.GetBufferByByte<BF16>(offset)` is actually valid for a write
-  of this size — the whole 512 KB is handed to `l1Buf`, but the destination
-  extent implied by `dstNzC0Stride` may run past what the descriptor allows.
-- Whether `DataCopy(LocalTensor, GlobalTensor, Nd2NzParams)` is the supported
-  overload here at all, versus going through `CopyGmToL1`.
+Then create a devspace with the recipe in `docs/bringup.md`. The work on the
+card lives under `/user/zhouyiran/flashkda` (JuiceFS), so it survived the pod.
 
-The durable fix remains replacing the hand-rolled `Nd2NzParams` /
+**Then run the experiment that decides the current hypothesis.**
+`FlashKDA-Ascend/tests/aic_resource_probe.cpp` is a standalone three-stage
+program, about two minutes end to end:
+
+| Stage | What the AIC does |
+|---|---|
+| A | constructs `Catlass::Arch::Resource<ArchTag>`, returns |
+| B | constructs its own `TPipe` + `TBuf<A1>`, returns |
+| C | stage B plus one `Nd2Nz` GM→L1 `DataCopy` |
+
+If **A hangs and B completes**, the hypothesis holds: `Resource` constructs
+*every* buffer unconditionally — including a 192 KB UB allocation through
+`GetTPipePtr()->InitBuffer` — and the cube has no UB. The vector phases survive
+it because asking a vector core for L1 is harmless; asking the cube for UB is
+not. The fix for that is already committed (see below).
+
+If **A completes and C hangs**, `Resource` is innocent and the fault is the
+`DataCopy` itself; the next suspect is the L1 destination extent rather than the
+descriptor, because the descriptor fields were verified correct — `CopyGmToL1`
+derives `dstNzC0Stride = layoutDst.stride(3) / ELE_NUM_PER_C0`, and for a
+`[16,128]` bf16 zN tile `zN::MakeLayout` gives `stride(3) = rowsRound * 16 = 256`,
+so `dstNzC0Stride = 16` and `dstNzNStride = 1`, which is exactly what the
+hanging code passes.
+
+### The candidate fix, already committed but untested
+
+Kernel1 no longer uses `Catlass::Arch::Resource`. Each phase constructs a holder
+with only the buffers its core type owns, sized to the phase rather than to the
+whole on-chip capacity:
+
+- `K1AivBufs` — one `TPipe` + `TBuf<VECCALC>` of `K1Ub::kEnd` bytes.
+- `K1AicBufs` — one `TPipe` + `TBuf<A1>` of `K1L1::kEnd`, plus L0A/L0B of 4 KB
+  each and L0C of 1 KB.
+
+This is the same shape as the `aiv_only` probe that returned numerically exact
+results on the card, which is the only buffer pattern proven to work in this
+environment.
+
+**It has not been compiled or run** — the card expired before it could be. Treat
+it as a hypothesis with code attached, and be ready to revert if stage A of the
+probe completes.
+
+### After that
+
+The durable cleanup remains replacing the hand-rolled `Nd2NzParams` /
 `LoadData2DParams` / `FixpipeParamsV220` in `Gemm128`, `Gemm16`, `LoadBt`
 (kernel1) and `Gemm`, `GemmAt`, `LoadNd2Nz` (kernel2) with the catlass tile
 classes, which take layouts and derive every stride themselves:
@@ -103,6 +142,10 @@ Build layouts with `layout::RowMajor(rows, cols)` and
 Kernel2 still uses cross-core handshakes and needs the same split treatment once
 kernel1's cube path runs. It is serial across chunks, so the chunk loop probably
 has to move to the host.
+
+Nothing has been validated numerically yet beyond the `aiv_only` probe. Once the
+forward pass completes, `tests/test_npu_nocompute.py` prints `err_ratio` against
+the CPU reference; bf16 end to end should land near 1e-2.
 
 ## Diagnostics left in the tree
 
