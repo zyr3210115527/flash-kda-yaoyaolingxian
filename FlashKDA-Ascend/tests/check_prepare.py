@@ -65,6 +65,31 @@ def gate_and_decay(q, k, g, beta, A_log, dt_bias, scale, lower_bound):
     }
 
 
+def cube_expect(q, k, g, beta, A_log, dt_bias, scale, lower_bound):
+    """CPU expectation for kernel1's AIC outputs: Mqk and INV.
+
+    L    = k_decayed @ k_inv^T, strictly-lower masked and scaled by
+           sigmoid(beta[i]) on row i.
+    Mqk  = q_decayed @ k_inv^T, lower-triangular including the diagonal.
+    INV  = (I + L)^-1, which the kernel builds as
+           (I-L)(I+L^2)(I+L^4)(I+L^8).
+    """
+    d = gate_and_decay(q, k, g, beta, A_log, dt_bias, scale, lower_bound)
+    k_dec = d['k_decayed']
+    q_dec = d['q_decayed']
+    k_inv = d['k_inv']
+
+    L = k_dec @ k_inv.t()
+    Mqk = torch.tril(q_dec @ k_inv.t())
+
+    bs = torch.sigmoid(beta.double()).unsqueeze(-1)
+    L = torch.tril(L, diagonal=-1) * bs
+
+    I = torch.eye(CHUNK, dtype=torch.float64)
+    INV = torch.linalg.inv(I + L)
+    return {'Mqk': Mqk, 'INV': INV}
+
+
 def cpu_selfcheck():
     """Cross-check the expectations above against torch_ref's own intermediates."""
     import torch_ref as TR
@@ -163,9 +188,16 @@ def npu_check():
     exp = gate_and_decay(q[0, :, 0], k[0, :, 0], g[0, :, 0], None,
                          A_log[0], dt_bias[0], scale, lower_bound)
 
+    # Cube outputs. Offsets follow WorkspaceOffsets: kINV = 16896, kMqk = 17408.
+    got['INV'] = field(16896, CHUNK * CHUNK, 'e', 2).reshape(CHUNK, CHUNK)
+    got['Mqk'] = field(17408, CHUNK * CHUNK, 'e', 2).reshape(CHUNK, CHUNK)
+    exp.update(cube_expect(q[0, :, 0], k[0, :, 0], g[0, :, 0], beta[0, :, 0],
+                           A_log[0], dt_bias[0], scale, lower_bound))
+
     print("kernel1 prepare output vs CPU:")
     allok = True
-    for name in ('k_decayed', 'q_decayed', 'k_inv', 'k_restored', 'g_total'):
+    for name in ('k_decayed', 'q_decayed', 'k_inv', 'k_restored', 'g_total',
+                 'Mqk', 'INV'):
         e = exp[name].double()
         a = got[name].double()
         rel = ((a - e).flatten().square().mean().sqrt() /

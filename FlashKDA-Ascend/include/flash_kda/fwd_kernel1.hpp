@@ -566,6 +566,8 @@ private:
     {
         auto lf = bufs.template Ub<float>(K1Ub::kLf);
         auto mf = bufs.template Ub<float>(K1Ub::kMqkF);
+        // bsig occupies only CHUNK floats of kTmp; a 16x16 tile past it is free.
+        auto lt = bufs.template Ub<float>(K1Ub::kTmp + 256);
         auto sa = bufs.template Ub<BF16>(K1Ub::kSmallA);
         auto sb = bufs.template Ub<BF16>(K1Ub::kSmallB);
 
@@ -631,6 +633,10 @@ private:
                     v = -(lf.GetValue(i * CHUNK + j) * bs);
                 }
                 lf.SetValue(i * CHUNK + j, v);
+                // L itself, strictly lower: the Neumann iteration squares this,
+                // and (I - L) cannot stand in for it since (I-L)^2 has extra
+                // terms. v already carries the sign flip, so negate it back.
+                lt.SetValue(i * CHUNK + j, (i > j) ? -v : 0.0f);
                 if (i < j) {
                     mf.SetValue(i * CHUNK + j, 0.0f);
                 }
@@ -645,9 +651,20 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
 
-        // (I - L) into slot 0 for the AIC; Mqk is final.
+        // (I - L) into slot 0 for the AIC; Mqk is final; plain masked L into
+        // slot 5, which the Neumann iteration needs in order to square it.
+        // (I - L) cannot be squared in its place: (I-L)^2 = I - 2L + L^2.
         AscendC::DataCopy(wsB[Slot(span, headIdx, 0) / 2], sa, CHUNK * CHUNK);
         AscendC::DataCopy(wsB[Ws(span, headIdx, WorkspaceOffsets::kMqk) / 2], sb, CHUNK * CHUNK);
+
+        // L into slot 5 for the Neumann iteration.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((event_t)0);
+        AscendC::Cast(sa, lt, AscendC::RoundMode::CAST_RINT, CHUNK * CHUNK);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
+        AscendC::DataCopy(wsB[Slot(span, headIdx, 5) / 2], sa, CHUNK * CHUNK);
+
     }
 
     // ---------------- AIC round 1 ----------------
@@ -797,7 +814,9 @@ private:
         const int64_t p = Slot(span, headIdx, 4);   // running product
         const int64_t ident = Ws(span, headIdx, WorkspaceOffsets::kIdentity);
 
-        Gemm16(bufs, params, a, a, l, true, true);        // L^2
+        // L itself, from slot 5. Squaring (I - L) would give I - 2L + L^2.
+        const int64_t lbase = Slot(span, headIdx, 5);
+        Gemm16(bufs, params, lbase, lbase, l, true, true);   // L^2
         Gemm16(bufs, params, a, ident, p, true, true);    // P <- (I - L)
 
         for (int j = 0; j < 3; ++j) {
