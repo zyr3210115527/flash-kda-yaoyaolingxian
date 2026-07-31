@@ -2,22 +2,34 @@
 
 Measured on one Ascend 910B3, CANN 8.5.0, bf16, D=128. Wall clock around a
 synchronize (torch_npu's event API needs operator kernels this image lacks),
-3 warmup + 10 iterations.
+3 warmup + 10 iterations, **workspace allocated once outside the timing loop**
+(`benchmarks/bench_hoisted.py`).
 
-**This is an untuned kernel.** Nothing has been optimized; correctness came
-first. The numbers below are a starting point, not a result.
+That last point is the whole story of the first round of measurements. The
+original harness called the `flash_kda.fwd` wrapper, which allocates the
+workspace on every call:
+
+    workspace = torch.zeros(get_workspace_size(...), dtype=uint8).to(device)
+
+At T=1024 H=8 that is 302 MB of host-side zeros copied to the device per call.
+It accounted for 88–98% of every number in the first version of this file. The
+tell was that stubbing out every phase of kernel1 changed the total by 2%.
 
 ## Measurements
 
-| T | H | chunks | k2 launches | workspace | ms | µs/token/head |
+Full pipeline, and kernel1 alone (`FLASH_KDA_SKIP_K2=1`):
+
+| T | H | workspace | per-call alloc | hoisted | kernel1 only | µs/token/head |
 |---:|---:|---:|---:|---:|---:|---:|
-| 128 | 4 | 8 | 42 | 21 M | 4.158 | 8.1220 |
-| 256 | 4 | 16 | 82 | 40 M | 7.478 | 7.3023 |
-| 512 | 4 | 32 | 162 | 77 M | 11.312 | 5.5233 |
-| 512 | 8 | 32 | 162 | 154 M | 19.148 | 4.6748 |
-| 1024 | 8 | 64 | 322 | 302 M | 27.250 | 3.3264 |
-| 2048 | 8 | 128 | 642 | 599 M | 43.486 | 2.6542 |
-| 2048 | 16 | 128 | 642 | 1198 M | 80.497 | 2.4566 |
+| 512 | 8 | 154 M | 19.97 | 1.63 | 0.40 | 0.3973 |
+| 1024 | 8 | 302 M | 29.88 | 3.18 | 0.76 | 0.3885 |
+| 2048 | 8 | 599 M | 53.57 | 6.33 | 1.47 | 0.3861 |
+| 2048 | 16 | 1198 M | 101.94 | 9.13 | 2.90 | 0.2785 |
+| 4096 | 8 | 1193 M | 104.38 | 12.73 | 2.90 | 0.3885 |
+
+Kernel2 is now the expensive half (~2.4 ms of 3.18 at T=1024 H=8), not
+kernel1. That inverts the original conclusion, which was an artifact of the
+allocation.
 
 ## Against the CUDA version
 
@@ -28,55 +40,92 @@ The CUDA implementation's own benchmark, on an H20:
 | T=8192 H=64 D=128 fixed | 1.6217 | 0.0031 |
 | T=8192 H=96 D=128 fixed | 2.6220 | 0.0033 |
 
-So roughly **790× slower per token-head** at our best measured shape.
+Roughly **90× slower per token-head**, not the 790× the allocation-dominated
+numbers suggested.
 
-Two caveats that make this a scale reference rather than a like-for-like
-comparison: different hardware (910B vs H20), and different shapes — the
-Ascend workspace does not currently reach T=8192 (see below), and our
-µs/token/head is still falling with size, so the gap would narrow somewhat at
-larger T.
+Different hardware (910B vs H20) and different shapes — our workspace does not
+reach T=8192 — so treat this as a scale reference, not a like-for-like result.
 
-## Where the time actually goes
+## A PyTorch baseline would be the honest comparison, and cannot run here
 
-Not where I expected. Breaking it down (`benchmarks/bench_breakdown.py`):
+Comparing against CUDA-on-H20 conflates the code with the hardware. The
+question worth answering is whether this kernel beats a straightforward
+PyTorch implementation *on the same card*. `benchmarks/bench_torch_baseline.py`
+implements that, but it cannot run on this devspace: every aclnn operator
+fails with error 561103, including `add` and `matmul`. The image installs the
+CANN toolkit without the binary operator package —
 
-| T | H | kernel1 ms | full ms | kernel2 ms | launches | launch ms | launch % |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 512 | 8 | 18.97 | 20.40 | 1.42 | 166 | 1.20 | 6% |
-| 1024 | 8 | 28.83 | 30.16 | 1.33 | 326 | 2.35 | 8% |
-| 2048 | 8 | 51.58 | 53.87 | 2.29 | 646 | 4.65 | 9% |
+    $ASCEND_OPP_PATH/built-in/op_impl/ai_core/tbe/kernel/ascend910b/
 
-**kernel1 is ~93% of the runtime.** Kernel2 — the part with five launches per
-chunk, the design I was most suspicious of — costs 1–2 ms. An empty kernel
-launch measures 7.2 µs, so all the launches together are under 10%.
+contains only `ops_oam`. Our kernels are unaffected because `.asc` files are
+compiled directly and never dispatch through that path, which is also why the
+correctness suite works (its reference runs on CPU). Running the baseline
+needs an image with `Ascend-cann-kernels-910b`.
 
-The cause is that kernel1's per-tile work is written as scalar and per-row
-loops, each carrying a pipeline flush:
+## Where the time actually goes in kernel1
 
-- `NormalizeRow` runs twice per row over 16 rows — 32 calls per tile, each a
-  `Mul` + `ReduceSum` + `V_S` + scalar read + `S_V` + `Muls`. That is 32
-  scalar/vector round trips per tile just to L2-normalize.
-- the gate + cumsum loop is 16 sequential iterations with a `PipeBarrier` each
-- `Decay` is 16 iterations of ~10 vector ops with 14 `PipeBarrier`s
-- `MaskAndBuild` builds the 16×16 mask with a scalar double loop — 256+
-  `GetValue`/`SetValue`
-- `ComputeNeumann` issues 9 GEMMs, each a full Nd2Nz → LoadData → Mmad →
-  Fixpipe round trip through GM
+Phase by phase, cumulative, each phase stubbed out and added back:
 
-## What to do about it, in order
+| | ms |
+|---|---:|
+| launch only, all phases stubbed | 0.06 |
+| + Prepare (AIV) | 0.28 |
+| + LMqk (AIC, 2 gemms) | 0.30 |
+| + Mask (AIV) | 0.47 |
+| + Neumann (AIC, 16 gemms) | 0.98 |
 
-1. **Batch the L2 normalization.** All 16 rows at once instead of 32 separate
-   reduce-and-scale round trips. Biggest single win available.
-2. **Vectorize `MaskAndBuild`.** The tril mask and beta scaling are elementwise
-   over a 16×16 tile; building them with scalar stores is the wrong shape
-   entirely. `Duplicate` + a comparison mask would do it.
-3. **Keep the Neumann iteration in L0C.** Nine GM round trips for nine 16×16
-   MMADs is almost all overhead. `Mmad`'s accumulate mode can chain them.
-4. **Fuse the decay loop.** It is 16 iterations over a `[16,128]` tile that
-   could largely be single whole-tile vector ops.
-5. **Shrink the workspace.** It is `H × total_tiles × 608 KB` because every
-   scratch slot is sized for a `[128,128]` fp32 state, but only kernel2's state
-   slots need that, and those are per (sequence, head) rather than per (tile,
-   head). At T=8192 H=64 the current layout would want ~20 GB. Fixing this is
-   what unblocks benchmarking at the CUDA version's shapes.
-6. Only then worry about launch count.
+Neumann was over half of kernel1, and the two vector phases most of the rest.
+The cube gemms in LMqk are nearly free.
+
+## What was tried
+
+Measured, in order, with the outcome rather than the prediction:
+
+1. **Batch the L2 normalization** — predicted the biggest win, delivered no
+   measurable change. `NormalizeRow` ran 32 times per tile, each with a V_S/S_V
+   round trip; batching it to 2 flushes was correct but the flushes were not
+   the bottleneck. Kept because it is the same arithmetic in less code. The
+   mistake was picking it by reasoning instead of measuring first.
+
+2. **Grid-stride kernel1** — no measurable change, and reverted. blockDim was
+   `total_tiles * H` (512 at T=1024 H=8) against 20 physical cube cores.
+   Dispatching 512 blocks costs 0.55 ms with the phases stubbed versus 0.05 ms
+   with 20, so the scheduling work is real — but total kernel1 time was 0.97 ms
+   either way, because dispatch overlaps with compute. Reverted after it also
+   turned out to expose a hazard: the phase code assumes one unit per core, and
+   hoisting the per-unit `TPipe` out of the loop (which the pattern requires)
+   corrupted `Mqk` outright.
+
+3. **Fuse the Neumann series** — the one that worked. 0.97 → 0.76 ms for
+   kernel1, about 20%. `ComputeNeumann` issued 16 cube round trips, and 10 of
+   them were `X * I`: matrix copies done as 16×16×16 matmuls, a full
+   GM→L1→L0→cube→L0C→GM trip with five barriers to move 512 bytes. They existed
+   because `Gemm16` cannot write its destination in place. Replaced by a fused
+   `dst = A*B1 + A*B2` (two Mmads, one L0C accumulator, one Fixpipe) plus
+   ping-pong buffers, so each factor `P*(I + L^k)` is one trip instead of three.
+   16 round trips became 6.
+
+## What to do next
+
+1. **Kernel2**, which is now ~75% of the pipeline and has never been profiled.
+   The five-launches-per-chunk structure is the obvious suspect, but that is
+   exactly the kind of guess that was wrong twice above — measure first.
+2. **Vectorize `MaskAndBuild`.** It builds a 16×16 mask with a scalar double
+   loop, 256+ `GetValue`/`SetValue`. The Mask phase is 0.17 ms.
+3. **Fuse the decay loop** — 16 iterations over a `[16,128]` tile that could be
+   whole-tile vector ops. Part of the 0.22 ms Prepare phase.
+4. **Shrink the workspace.** `H × total_tiles × 608 KB`, because every scratch
+   slot is sized for a `[128,128]` fp32 state when only kernel2's state slots
+   need that, and those are per (sequence, head) not per (tile, head). At
+   T=8192 H=64 the current layout wants ~20 GB. This is what blocks
+   benchmarking at the CUDA version's shapes, and it also dominates real-world
+   cost: the per-call allocation above is 88–98% of end-to-end time for any
+   caller that does not hoist it.
+
+## A note on the numbers above
+
+Every measurement here was taken after fixing a race in `Gemm128` (see
+`tests/race_*.py`) under which only the last cube result before the kernel
+ended was reliable. Before that fix the suite still passed, but the same shape
+gave different errors on different runs, and `Mqk` was stably wrong. Timings
+taken before it are not comparable.
