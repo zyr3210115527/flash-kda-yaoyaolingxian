@@ -17,19 +17,15 @@ tell was that stubbing out every phase of kernel1 changed the total by 2%.
 
 ## Measurements
 
-Full pipeline, and kernel1 alone (`FLASH_KDA_SKIP_K2=1`):
+| T | H | workspace | end-to-end ms | kernel1 ms | µs/token/head |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 8 | 154 M | 1.40 | 0.40 | 0.3410 |
+| 1024 | 8 | 302 M | 2.73 | 0.76 | 0.3330 |
+| 2048 | 8 | 599 M | 5.41 | 1.47 | 0.3292 |
+| 2048 | 16 | 1198 M | 7.55 | 2.90 | 0.2307 |
+| 4096 | 8 | 1193 M | 10.83 | 2.90 | 0.3309 |
 
-| T | H | workspace | per-call alloc | hoisted | kernel1 only | µs/token/head |
-|---:|---:|---:|---:|---:|---:|---:|
-| 512 | 8 | 154 M | 19.97 | 1.63 | 0.40 | 0.3973 |
-| 1024 | 8 | 302 M | 29.88 | 3.18 | 0.76 | 0.3885 |
-| 2048 | 8 | 599 M | 53.57 | 6.33 | 1.47 | 0.3861 |
-| 2048 | 16 | 1198 M | 101.94 | 9.13 | 2.90 | 0.2785 |
-| 4096 | 8 | 1193 M | 104.38 | 12.73 | 2.90 | 0.3885 |
-
-Kernel2 is now the expensive half (~2.4 ms of 3.18 at T=1024 H=8), not
-kernel1. That inverts the original conclusion, which was an artifact of the
-allocation.
+End-to-end at T=1024 H=8 started this round at 29.96 ms and is now 2.73 ms.
 
 ## Against the CUDA version
 
@@ -62,9 +58,9 @@ compiled directly and never dispatch through that path, which is also why the
 correctness suite works (its reference runs on CPU). Running the baseline
 needs an image with `Ascend-cann-kernels-910b`.
 
-## Where the time actually goes in kernel1
+## Where the time goes
 
-Phase by phase, cumulative, each phase stubbed out and added back:
+Kernel1, phase by phase, cumulative (each phase stubbed out and added back):
 
 | | ms |
 |---|---:|
@@ -74,8 +70,20 @@ Phase by phase, cumulative, each phase stubbed out and added back:
 | + Mask (AIV) | 0.47 |
 | + Neumann (AIC, 16 gemms) | 0.98 |
 
-Neumann was over half of kernel1, and the two vector phases most of the rest.
-The cube gemms in LMqk are nearly free.
+Kernel2, same method (kernel1 held at a fixed 0.76 ms):
+
+| | ms |
+|---|---:|
+| kernel1 + 322 empty kernel2 launches | 2.610 |
+| + BuildU (AIV) | 2.498 |
+| + PreGemms (AIC) | 2.684 |
+| + FinishOut (AIV) | 2.692 |
+| + PostGemms (AIC) | 2.711 |
+| + FinishChunk (AIV) | 3.096 |
+
+**Kernel2 is 79% launch overhead.** 322 launches at ~5.7 µs is 1.85 ms; all
+five phases together cost 0.49 ms. The thing to cut there is launch count, not
+work.
 
 ## What was tried
 
@@ -83,44 +91,61 @@ Measured, in order, with the outcome rather than the prediction:
 
 1. **Batch the L2 normalization** — predicted the biggest win, delivered no
    measurable change. `NormalizeRow` ran 32 times per tile, each with a V_S/S_V
-   round trip; batching it to 2 flushes was correct but the flushes were not
-   the bottleneck. Kept because it is the same arithmetic in less code. The
-   mistake was picking it by reasoning instead of measuring first.
+   round trip; batching to 2 flushes was correct but the flushes were not the
+   bottleneck. Kept because it is the same arithmetic in less code.
 
-2. **Grid-stride kernel1** — no measurable change, and reverted. blockDim was
-   `total_tiles * H` (512 at T=1024 H=8) against 20 physical cube cores.
-   Dispatching 512 blocks costs 0.55 ms with the phases stubbed versus 0.05 ms
-   with 20, so the scheduling work is real — but total kernel1 time was 0.97 ms
-   either way, because dispatch overlaps with compute. Reverted after it also
-   turned out to expose a hazard: the phase code assumes one unit per core, and
-   hoisting the per-unit `TPipe` out of the loop (which the pattern requires)
-   corrupted `Mqk` outright.
+2. **Grid-stride kernel1** — no change, reverted. blockDim was 512 against 20
+   cube cores. Dispatching 512 blocks costs 0.55 ms with phases stubbed versus
+   0.05 ms with 20, but total kernel1 time was 0.97 ms either way: dispatch
+   overlaps with compute, so the stubbed figure is throughput in isolation, not
+   an additive cost.
 
-3. **Fuse the Neumann series** — the one that worked. 0.97 → 0.76 ms for
-   kernel1, about 20%. `ComputeNeumann` issued 16 cube round trips, and 10 of
-   them were `X * I`: matrix copies done as 16×16×16 matmuls, a full
-   GM→L1→L0→cube→L0C→GM trip with five barriers to move 512 bytes. They existed
-   because `Gemm16` cannot write its destination in place. Replaced by a fused
-   `dst = A*B1 + A*B2` (two Mmads, one L0C accumulator, one Fixpipe) plus
-   ping-pong buffers, so each factor `P*(I + L^k)` is one trip instead of three.
-   16 round trips became 6.
+3. **Fuse the Neumann series** — worked: kernel1 0.97 → 0.76 ms, about 20%.
+   `ComputeNeumann` issued 16 cube round trips and 10 were `X * I`, matrix
+   copies done as 16×16×16 matmuls — a full GM→L1→L0→cube→L0C→GM trip with five
+   barriers to move 512 bytes. Replaced with a fused `dst = A*B1 + A*B2` (two
+   Mmads, one L0C accumulator, one Fixpipe) plus ping-pong buffers. 16 → 6.
+
+4. **Fold BuildU into the previous chunk's FinishChunk** — worked: 3.18 → 2.81
+   ms, about 12%. The per-chunk chain PreGemms(AIC) → FinishOut(AIV) →
+   PostGemms(AIC) → FinishChunk(AIV) alternates core type at every arrow, so
+   those boundaries are forced while cross-core sync is unavailable. BuildU of
+   chunk t+1 is AIV and already ran right after FinishChunk of chunk t, so that
+   boundary bought nothing. 5 launches per chunk became 4.
+
+   Hoisting BuildU out of the loop entirely was tried first and broke every
+   multi-chunk shape: it ends with `StateToBf16`, which reads the live
+   recurrent state. The byte-identical error across three different fixes was
+   the clue that the state read, not the v/beta work, pinned it to the loop.
+
+5. **Stop reallocating the workspace** — the largest win of the round for real
+   callers: 29.96 → 2.73 ms end-to-end, about 11×. The wrapper allocated and
+   zeroed 302 MB on the host and copied it to the device on every call. The
+   zeroing was a guard against reading a slot before writing it;
+   `tests/workspace_poison.py` shows output is bit-identical with the workspace
+   filled with NaN, so nothing does. Now allocated on device and cached.
 
 ## What to do next
 
-1. **Kernel2**, which is now ~75% of the pipeline and has never been profiled.
-   The five-launches-per-chunk structure is the obvious suspect, but that is
-   exactly the kind of guess that was wrong twice above — measure first.
-2. **Vectorize `MaskAndBuild`.** It builds a 16×16 mask with a scalar double
+1. **Move FinishOut to the cube.** It computes
+   `u = (v − k_dec@state) · sigmoid(beta)`, a row-broadcast scale, which is
+   `diag(beta) @ (v − k_dec@state)`. If it runs on AIC, PreGemms + FinishOut +
+   PostGemms collapse into one launch and the chunk costs 2 launches instead of
+   4 — roughly another 0.7 ms. The risk is precision, not structure: it forces
+   `k_dec@state` through bf16 before the subtraction, and the delta rule makes
+   `v − k_dec@state` a cancelling difference, so this needs measuring before
+   it is believed.
+2. **Raise CHUNK from 16.** Chunk count drives kernel2's launch count directly,
+   and 16×16×16 is the cube's minimum fractal, so every gemm is one fractal of
+   work behind full instruction overhead. CHUNK=64 would cut launches 4× and
+   make each gemm 64 fractals. It is a large change: masks, buffer sizes, and
+   two more Neumann factors.
+3. **Vectorize `MaskAndBuild`** — builds a 16×16 mask with a scalar double
    loop, 256+ `GetValue`/`SetValue`. The Mask phase is 0.17 ms.
-3. **Fuse the decay loop** — 16 iterations over a `[16,128]` tile that could be
-   whole-tile vector ops. Part of the 0.22 ms Prepare phase.
 4. **Shrink the workspace.** `H × total_tiles × 608 KB`, because every scratch
    slot is sized for a `[128,128]` fp32 state when only kernel2's state slots
-   need that, and those are per (sequence, head) not per (tile, head). At
-   T=8192 H=64 the current layout wants ~20 GB. This is what blocks
-   benchmarking at the CUDA version's shapes, and it also dominates real-world
-   cost: the per-call allocation above is 88–98% of end-to-end time for any
-   caller that does not hoist it.
+   need that. At T=8192 H=64 the layout wants ~20 GB, which is what blocks
+   benchmarking at the CUDA version's shapes.
 
 ## A note on the numbers above
 
