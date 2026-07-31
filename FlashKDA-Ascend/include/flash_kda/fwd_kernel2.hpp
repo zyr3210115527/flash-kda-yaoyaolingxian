@@ -391,6 +391,18 @@ private:
         }
     }
 
+    // Every phase is its own launch, so the stream orders them -- but a GM write
+    // from one core type is not automatically visible to the next phase running
+    // on the other. Without this the results drift run to run and occasionally
+    // fault, which is exactly what was measured.
+    template <class T>
+    CATLASS_DEVICE void FlushGm(AscendC::GlobalTensor<T> gm, int64_t elemOff, int count)
+    {
+        AscendC::DataCacheCleanAndInvalid<T, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(gm[elemOff]);
+        (void)count;
+    }
+
     CATLASS_DEVICE
     void InitState(K2AivBufs& bufs, Params const& params, int seqIdx, int headIdx)
     {
@@ -422,6 +434,7 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)0);
         AscendC::DataCopy(gmS[dst / 4], sa, D * D);
+        FlushGm<float>(gmS, dst / 4, D * D);
     }
 
     // u = Mqk @ v - (INV @ k_dec) @ state, staged so the AIC can do both GEMMs
@@ -451,6 +464,7 @@ private:
         AscendC::GlobalTensor<BF16> wsB;
         wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
         AscendC::DataCopy(wsB[Slot(params, tileIdx, headIdx, 2) / 2], vb, CHUNK * D);
+        FlushGm<BF16>(wsB, Slot(params, tileIdx, headIdx, 2) / 2, CHUNK * D);
 
         // sigmoid(beta) for this chunk's rows, into slot 1 as fp32. FinishOut
         // needs it and runs as a separate launch, so it has to go through GM.
@@ -499,6 +513,7 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)7);
             AscendC::DataCopy(wsF[Slot(params, tileIdx, headIdx, 1) / 4], bsig, CHUNK);
+        FlushGm<float>(wsF, Slot(params, tileIdx, headIdx, 1) / 4, CHUNK);
         }
 
         StateToBf16(bufs, params, tileIdx, headIdx);
@@ -525,6 +540,7 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)1);
         AscendC::DataCopy(wsB[Slot(params, tileIdx, headIdx, 3) / 2], sb, D * D);
+        FlushGm<BF16>(wsB, Slot(params, tileIdx, headIdx, 3) / 2, D * D);
     }
 
     // After round 1 the cube left  slot4 = Mqk @ v  and  slot5 = (INV@k_dec)@state.
@@ -581,6 +597,7 @@ private:
 
         // u for round 2's two GEMMs (Mqk @ u and k_res^T @ u).
         AscendC::DataCopy(wsB[Slot(params, tileIdx, headIdx, 2) / 2], ub, CHUNK * D);
+        FlushGm<BF16>(wsB, Slot(params, tileIdx, headIdx, 2) / 2, CHUNK * D);
         (void)tokenBase;
         (void)len;
     }
@@ -625,6 +642,7 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)3);
         AscendC::DataCopy(gmS[stateOff / 4], sf, D * D);
+        FlushGm<float>(gmS, stateOff / 4, D * D);
     }
 
     // out = slot6 + slot8, both fp32 from the cube; rounded once to bf16 as the

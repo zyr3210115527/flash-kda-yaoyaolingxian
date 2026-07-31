@@ -42,10 +42,15 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
     T_total = B * T_seq
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
 
-    workspace = torch.empty(
-        get_workspace_size(T_total, H, N),
-        dtype=torch.uint8, device=q.device
-    )
+    # Zeroed, not empty. The kernels write most of the workspace before reading
+    # it, but any slot read before being written would otherwise pick up
+    # whatever was in device memory -- which makes results vary run to run and
+    # is exactly the kind of bug that is painful to find later. Zeros are
+    # produced on the host and copied, because torch_npu's fill needs an
+    # operator kernel that some CANN images do not ship.
+    workspace = torch.zeros(
+        get_workspace_size(T_total, H, N), dtype=torch.uint8
+    ).to(q.device)
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
              initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
