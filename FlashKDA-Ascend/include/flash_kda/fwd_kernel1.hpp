@@ -829,11 +829,6 @@ private:
         auto l0B = bufs.template L0B<BF16>();
         auto l0C = bufs.template L0C<float>();
 
-        if (init) {
-            AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
-        }
-
         AscendC::Nd2NzParams p;
         p.ndNum = 1;
         p.nValue = CHUNK;
@@ -890,7 +885,14 @@ private:
 
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)1);
+
+        // ComputeNeumann chains nine of these, each reloading the same L1 slots
+        // from the GM the previous Fixpipe just wrote. The next MTE2 must not
+        // start before that Fixpipe retires, so this is a barrier -- set and
+        // wait together. Previously the set had no matching wait, so nine
+        // unconsumed FIX_MTE2 events accumulated and the core stalled.
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
     }
 };
 
