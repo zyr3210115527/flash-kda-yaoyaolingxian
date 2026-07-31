@@ -617,7 +617,7 @@ private:
         wsF.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
 
         const int64_t stateOff = StateOff(params, seqIdx, headIdx);
-        AscendC::DataCopy(sf, gmS[stateOff / 4], D * D);
+                AscendC::DataCopy(sf, gmS[stateOff / 4], D * D);
         AscendC::DataCopy(upd, wsF[Slot(params, tileIdx, headIdx, 7) / 4], D * D);
         // g_total is already exponentiated by kernel 1; exponentiating it again
         // here was one of the draft's algorithmic errors.
