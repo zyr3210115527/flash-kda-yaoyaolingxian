@@ -214,7 +214,13 @@ void fwd(
         return;
     }
     launch_fwd_prepare(params, stream);
-    launch_fwd_recurrence(params, stream);
+    // Kernel2 still synchronizes its AIC and AIV halves with CrossCore flags,
+    // which deadlock when the kernel is launched from a Python extension (see
+    // docs/debugging-notes.md). Until it gets the same split kernel1 received,
+    // this lets kernel1 be exercised on its own.
+    if (std::getenv("FLASH_KDA_SKIP_K2") == nullptr) {
+        launch_fwd_recurrence(params, stream);
+    }
 }
 
 int64_t noop(at::Tensor flag) {

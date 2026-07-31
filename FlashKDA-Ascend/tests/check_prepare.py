@@ -139,6 +139,14 @@ def npu_check():
     import struct
 
     def field(off, count, fmt, size):
+        if fmt == 'e':
+            # bfloat16, NOT IEEE fp16. struct has no bf16 code and 'e' silently
+            # reinterprets the exponent field, which turns correct data into
+            # garbage. bf16 is the top 16 bits of the fp32 pattern.
+            bits = struct.unpack_from(f'<{count}H', raw, off)
+            as_f32 = struct.unpack(f'<{count}f',
+                                   struct.pack(f'<{count}I', *(b << 16 for b in bits)))
+            return torch.tensor(as_f32)
         return torch.tensor(struct.unpack_from(f'<{count}{fmt}', raw, off))
 
     # Offsets must match WorkspaceOffsets in layout.hpp.

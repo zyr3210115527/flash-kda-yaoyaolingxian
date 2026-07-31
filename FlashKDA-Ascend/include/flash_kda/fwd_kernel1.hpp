@@ -94,7 +94,8 @@ struct K1AivBufs {
     CATLASS_DEVICE
     K1AivBufs()
     {
-        pipe.InitBuffer(ub, K1Ub::kEnd);
+        // Same reasoning: UB is this core's alone during the phase.
+        pipe.InitBuffer(ub, ArchTag::UB_SIZE);
     }
 
     template <class T>
@@ -114,10 +115,16 @@ struct K1AicBufs {
     CATLASS_DEVICE
     K1AicBufs()
     {
-        pipe.InitBuffer(l1, K1L1::kEnd);
-        pipe.InitBuffer(l0a, CHUNK * D * sizeof(BF16));
-        pipe.InitBuffer(l0b, D * CHUNK * sizeof(BF16));
-        pipe.InitBuffer(l0c, CHUNK * CHUNK * sizeof(float));
+        // Full architectural sizes. L0A/L0B/L0C are dedicated hardware buffers
+        // with nothing else contending for them, so sizing them to the exact
+        // tile bytes buys nothing and leaves zero slack for the alignment and
+        // padding the fractal loads assume. This matches how catlass sizes
+        // them; the deliberate difference from Arch::Resource is that no UB
+        // buffer is allocated here, because the cube has no UB.
+        pipe.InitBuffer(l1, ArchTag::L1_SIZE);
+        pipe.InitBuffer(l0a, ArchTag::L0A_SIZE);
+        pipe.InitBuffer(l0b, ArchTag::L0B_SIZE);
+        pipe.InitBuffer(l0c, ArchTag::L0C_SIZE);
     }
 
     template <class T>
@@ -157,10 +164,20 @@ public:
         int actualLen;      // real rows; < CHUNK on a tail tile
     };
 
+    // Each phase below is launched as its own kernel, and the Ascend compiler
+    // builds every kernel as a mix binary with both an _mix_aic and an
+    // _mix_aiv half. Without an explicit core-type guard the body runs on both
+    // halves -- so the cube phases would touch L1/L0 from a vector core, which
+    // faults with "The MPU address access is invalid". The AIC/AIV template
+    // specialization used to provide this guard; splitting into separate
+    // kernels means stating it directly.
     // Phase entry points. Each runs on one core type only; the four are
     // launched separately and ordered by the stream. See PHASES note above.
     CATLASS_DEVICE void RunPrepare(Params const& params)
     {
+        if constexpr (g_coreType != AscendC::AIV) {
+            return;
+        }
         const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
             return;
@@ -179,6 +196,9 @@ public:
 
     CATLASS_DEVICE void RunLMqk(Params const& params)
     {
+        if constexpr (g_coreType != AscendC::AIC) {
+            return;
+        }
         const uint32_t coreIdx = AscendC::GetBlockIdx();
         if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
             return;
@@ -194,6 +214,9 @@ public:
 
     CATLASS_DEVICE void RunMask(Params const& params)
     {
+        if constexpr (g_coreType != AscendC::AIV) {
+            return;
+        }
         const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
             return;
@@ -212,6 +235,9 @@ public:
 
     CATLASS_DEVICE void RunNeumann(Params const& params)
     {
+        if constexpr (g_coreType != AscendC::AIC) {
+            return;
+        }
         const uint32_t coreIdx = AscendC::GetBlockIdx();
         if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
             return;
@@ -646,13 +672,26 @@ private:
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
         auto l1B = bufs.template L1<BF16>(K1L1::kB);
 
+        // k_inv is [CHUNK, D] RowMajor in GM. Its transpose is the same bytes
+        // viewed as ColumnMajor [D, CHUNK]: element (d, t) sits at t*D + d,
+        // which is exactly ColumnMajor with a column pitch of D.
+        //
+        // Nd2Nz describes a ColumnMajor source by its *columns*, not its rows
+        // (catlass CopyGmToL1 for ColumnMajor -> nZ): nValue is the column
+        // count, dValue the length of a column, srcDValue the column pitch.
+        // Getting this backwards asks for 128 spans of 16 at a 128 pitch, which
+        // reads out to element 16272 of a 2048-element buffer -- an out-of-
+        // bounds GM read, and the aicore exception that produced.
+        //
+        // For nZ [D, CHUNK]: stride(1) = colsRound * C0 = 256 and stride(2) =
+        // C0 = 16, so dstNzC0Stride = 256/16 = CHUNK and dstNzNStride = 1.
         AscendC::Nd2NzParams p;
         p.ndNum = 1;
-        p.nValue = D;
-        p.dValue = CHUNK;
+        p.nValue = CHUNK;
+        p.dValue = D;
         p.srcNdMatrixStride = 0;
         p.srcDValue = D;
-        p.dstNzC0Stride = D;
+        p.dstNzC0Stride = CHUNK;
         p.dstNzNStride = 1;
         p.dstNzMatrixStride = 0;
         AscendC::DataCopy(l1B, gm[gmByte / 2], p);
