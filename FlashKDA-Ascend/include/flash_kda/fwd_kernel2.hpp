@@ -47,7 +47,8 @@ struct K2Ub {
     static constexpr uint32_t kBeta   = kGTotal + D * 4;         // [16] f32
     static constexpr uint32_t kStateA = kBeta + 2048;              // [128,128] f32 row block
     static constexpr uint32_t kStateB = kStateA + D * D * 4;
-    static constexpr uint32_t kScalar = kStateB + D * D * 4;
+    static constexpr uint32_t kNarrow = kStateB + D * D * 4;  // [D,D] bf16
+    static constexpr uint32_t kScalar = kNarrow + D * D * 2;
     static constexpr uint32_t kEnd    = kScalar + 256;
 };
 static_assert(K2Ub::kEnd < ArchTag::UB_SIZE, "kernel2 UB budget exceeded");
@@ -342,6 +343,17 @@ private:
     // ---------------- AIV ----------------
     // ---- state layout at the API boundary ----
     //
+    // Each phase is its own launch, so the stream orders them -- but a GM write
+    // from one core type is not automatically visible to the next phase running
+    // on the other.
+    template <class T>
+    CATLASS_DEVICE void FlushGm(AscendC::GlobalTensor<T> gm, int64_t elemOff, int count)
+    {
+        AscendC::DataCacheCleanAndInvalid<T, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(gm[elemOff]);
+        (void)count;
+    }
+
     // GM initial_state / final_state are [value, key]; internally the state is
     // [key, value] because that is the orientation every GEMM here wants. These
     // two helpers do the transpose, and only run once per (sequence, head).
@@ -349,58 +361,89 @@ private:
     // DataCopyPad gathers a strided column: D blocks of one element with a
     // (D-1)-element gap, which is destination row r drawn from gm[:, r].
 
+    // GM initial_state / final_state are [value, key]; internally the state is
+    // [key, value], the orientation every GEMM here wants. These run once per
+    // (sequence, head), not per chunk, so a scalar transpose is affordable.
+    //
+    // Deliberately not DataCopyPad: gathering a column with single-element
+    // blocks looks natural but DataCopyPad pads each block to a 32-byte
+    // datablock, so the values do not land contiguously. That is the bug that
+    // corrupted the beta load, and here it would be repeated D times per
+    // tensor. Copy whole, then transpose in fp32 with scalar reads.
+
     template <class T>
     CATLASS_DEVICE void StateGmToUbT(K2AivBufs& bufs, AscendC::LocalTensor<float> dst,
                                      AscendC::GlobalTensor<T> gm, int64_t base)
     {
-        AscendC::DataCopyExtParams p;
-        p.blockCount = static_cast<uint16_t>(D);
-        p.blockLen = static_cast<uint32_t>(sizeof(T));
-        p.srcStride = static_cast<uint32_t>((D - 1) * sizeof(T));
-        p.dstStride = 0;
-        AscendC::DataCopyPadExtParams<T> pad{false, 0, 0, static_cast<T>(0)};
-
         auto staging = bufs.template Ub<T>(K2Ub::kStateB);
-        for (int r = 0; r < D; ++r) {
-            AscendC::DataCopyPad(staging[r * D], gm[base + r], p, pad);
-        }
+        AscendC::DataCopy(staging, gm[base], D * D);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)6);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)6);
+
+        // Widen into dst first -- the scalar unit cannot convert bf16 -- then
+        // transpose dst in place. Swapping across the diagonal needs no second
+        // [D,D] buffer, which matters: three of them would exceed the 192 KB UB.
         if constexpr (std::is_same_v<T, float>) {
-            // Already fp32: the staging buffer is the result. Cast<float,float>
-            // is not a valid conversion.
             AscendC::DataCopy(dst, staging.template ReinterpretCast<float>(), D * D);
-            AscendC::PipeBarrier<PIPE_V>();
         } else {
             AscendC::Cast(dst, staging, AscendC::RoundMode::CAST_NONE, D * D);
-            AscendC::PipeBarrier<PIPE_V>();
         }
-    }
+        AscendC::PipeBarrier<PIPE_V>();
 
-    template <class T>
-    CATLASS_DEVICE void StateUbToGmT(K2AivBufs& bufs, AscendC::GlobalTensor<T> gm, int64_t base,
-                                     AscendC::LocalTensor<T> src)
-    {
-        AscendC::DataCopyExtParams p;
-        p.blockCount = static_cast<uint16_t>(D);
-        p.blockLen = static_cast<uint32_t>(sizeof(T));
-        p.srcStride = 0;
-        p.dstStride = static_cast<uint32_t>((D - 1) * sizeof(T));
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)6);
         for (int r = 0; r < D; ++r) {
-            AscendC::DataCopyPad(gm[base + r], src[r * D], p);
+            for (int c = r + 1; c < D; ++c) {
+                const float a = dst.GetValue(r * D + c);
+                const float b = dst.GetValue(c * D + r);
+                dst.SetValue(r * D + c, b);
+                dst.SetValue(c * D + r, a);
+            }
         }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)6);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)6);
     }
 
-    // Every phase is its own launch, so the stream orders them -- but a GM write
-    // from one core type is not automatically visible to the next phase running
-    // on the other. Without this the results drift run to run and occasionally
-    // fault, which is exactly what was measured.
+    // Takes the fp32 state and narrows on output itself. It must not be handed
+    // an already-narrowed bf16 copy: the caller's obvious place to put one is
+    // kStateB, which is the very buffer this widens into, and Cast would then
+    // read and overwrite the same address at two different widths.
     template <class T>
-    CATLASS_DEVICE void FlushGm(AscendC::GlobalTensor<T> gm, int64_t elemOff, int count)
+    CATLASS_DEVICE void StateUbToGmT(K2AivBufs& bufs, AscendC::GlobalTensor<T> gm,
+                                     int64_t base, AscendC::LocalTensor<float> src)
     {
-        AscendC::DataCacheCleanAndInvalid<T, AscendC::CacheLine::ENTIRE_DATA_CACHE,
-                                          AscendC::DcciDst::CACHELINE_OUT>(gm[elemOff]);
-        (void)count;
+        auto wide = bufs.template Ub<float>(K2Ub::kStateB);
+        AscendC::DataCopy(wide, src, D * D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)7);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)7);
+        for (int r = 0; r < D; ++r) {
+            for (int c = r + 1; c < D; ++c) {
+                const float a = wide.GetValue(r * D + c);
+                const float b = wide.GetValue(c * D + r);
+                wide.SetValue(r * D + c, b);
+                wide.SetValue(c * D + r, a);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)7);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)7);
+
+        // fp32 goes straight out of the transposed buffer; only bf16 needs a
+        // narrow staging copy, and at half the width it fits the UB budget --
+        // three [D,D] fp32 buffers would not.
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)7);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)7);
+        if constexpr (std::is_same_v<T, float>) {
+            AscendC::DataCopy(gm[base], wide.template ReinterpretCast<T>(), D * D);
+        } else {
+            auto outb = bufs.template Ub<T>(K2Ub::kNarrow);
+            AscendC::Cast(outb, wide, AscendC::RoundMode::CAST_RINT, D * D);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)8);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)8);
+            AscendC::DataCopy(gm[base], outb, D * D);
+        }
     }
 
     CATLASS_DEVICE
@@ -711,14 +754,12 @@ private:
             // sf is [key, value]; GM wants [value, key].
             StateUbToGmT<float>(bufs, gmFs, dst, sf);
         } else {
-            auto sb = bufs.template Ub<BF16>(K2Ub::kStateB);
-            AscendC::Cast(sb, sf, AscendC::RoundMode::CAST_RINT, D * D);
             AscendC::GlobalTensor<BF16> gmFs;
             gmFs.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.final_state));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             // sb is [key, value]; GM wants [value, key].
-            StateUbToGmT<BF16>(bufs, gmFs, dst, sb);
+            StateUbToGmT<BF16>(bufs, gmFs, dst, sf);
         }
     }
 
