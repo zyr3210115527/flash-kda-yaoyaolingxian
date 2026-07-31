@@ -31,6 +31,8 @@
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
+#include <type_traits>
+
 #include "kernel_operator.h"
 
 namespace flash_kda {
@@ -214,6 +216,57 @@ private:
     }
 
     // ---------------- AIV ----------------
+    // ---- state layout at the API boundary ----
+    //
+    // GM initial_state / final_state are [value, key]; internally the state is
+    // [key, value] because that is the orientation every GEMM here wants. These
+    // two helpers do the transpose, and only run once per (sequence, head).
+    //
+    // DataCopyPad gathers a strided column: D blocks of one element with a
+    // (D-1)-element gap, which is destination row r drawn from gm[:, r].
+
+    template <class T>
+    CATLASS_DEVICE void StateGmToUbT(AscendC::LocalTensor<float> dst,
+                                     AscendC::GlobalTensor<T> gm, int64_t base)
+    {
+        AscendC::DataCopyExtParams p;
+        p.blockCount = static_cast<uint16_t>(D);
+        p.blockLen = static_cast<uint32_t>(sizeof(T));
+        p.srcStride = static_cast<uint32_t>((D - 1) * sizeof(T));
+        p.dstStride = 0;
+        AscendC::DataCopyPadExtParams<T> pad{false, 0, 0, static_cast<T>(0)};
+
+        auto staging = resource_.ubBuf.template GetBufferByByte<T>(K2Ub::kStateB);
+        for (int r = 0; r < D; ++r) {
+            AscendC::DataCopyPad(staging[r * D], gm[base + r], p, pad);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)6);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)6);
+        if constexpr (std::is_same_v<T, float>) {
+            // Already fp32: the staging buffer is the result. Cast<float,float>
+            // is not a valid conversion.
+            AscendC::DataCopy(dst, staging.template ReinterpretCast<float>(), D * D);
+            AscendC::PipeBarrier<PIPE_V>();
+        } else {
+            AscendC::Cast(dst, staging, AscendC::RoundMode::CAST_NONE, D * D);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+    template <class T>
+    CATLASS_DEVICE void StateUbToGmT(AscendC::GlobalTensor<T> gm, int64_t base,
+                                     AscendC::LocalTensor<T> src)
+    {
+        AscendC::DataCopyExtParams p;
+        p.blockCount = static_cast<uint16_t>(D);
+        p.blockLen = static_cast<uint32_t>(sizeof(T));
+        p.srcStride = 0;
+        p.dstStride = static_cast<uint32_t>((D - 1) * sizeof(T));
+        for (int r = 0; r < D; ++r) {
+            AscendC::DataCopyPad(gm[base + r], src[r * D], p);
+        }
+    }
+
     CATLASS_DEVICE
     void InitState(Params const& params, int seqIdx, int headIdx)
     {
@@ -228,19 +281,14 @@ private:
                 AscendC::GlobalTensor<float> gmIn;
                 gmIn.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.initial_state));
                 const int64_t src = (static_cast<int64_t>(seqIdx) * params.H + headIdx) * D * D;
-                for (int r = 0; r < D; ++r) {
-                    AscendC::DataCopy(sa[r * D], gmIn[src + r * D], D);
-                }
+                // GM is [value, key]; sa is [key, value].
+                StateGmToUbT<float>(sa, gmIn, src);
             } else {
-                auto sb = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kStateB);
                 AscendC::GlobalTensor<BF16> gmIn;
                 gmIn.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.initial_state));
                 const int64_t src = (static_cast<int64_t>(seqIdx) * params.H + headIdx) * D * D;
-                AscendC::DataCopy(sb, gmIn[src], D * D);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)0);
-                AscendC::Cast(sa, sb, AscendC::RoundMode::CAST_NONE, D * D);
-                AscendC::PipeBarrier<PIPE_V>();
+                // GM is [value, key]; sa is [key, value].
+                StateGmToUbT<BF16>(sa, gmIn, src);
             }
         } else {
             AscendC::Duplicate(sa, 0.0f, D * D);
@@ -427,7 +475,8 @@ private:
             gmFs.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.final_state));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
-            AscendC::DataCopy(gmFs[dst], sf, D * D);
+            // sf is [key, value]; GM wants [value, key].
+            StateUbToGmT<float>(gmFs, dst, sf);
         } else {
             auto sb = resource_.ubBuf.template GetBufferByByte<BF16>(K2Ub::kStateB);
             AscendC::Cast(sb, sf, AscendC::RoundMode::CAST_RINT, D * D);
@@ -435,7 +484,8 @@ private:
             gmFs.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.final_state));
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)5);
-            AscendC::DataCopy(gmFs[dst], sb, D * D);
+            // sb is [key, value]; GM wants [value, key].
+            StateUbToGmT<BF16>(gmFs, dst, sb);
         }
     }
 
