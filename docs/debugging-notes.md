@@ -2,21 +2,94 @@
 
 ## Where things stand
 
-Both kernels are **rewritten**, the extension **builds and links**, and it
-**launches on a real 910B3**. Kernel1 is restructured into four single-core-type
-launches and its two AIV phases **run correctly on device**. The two AIC (cube)
-phases hang, so the forward pass does not complete end to end yet.
+**Kernel1 works on hardware.** All four phases run clean, and its outputs are
+verified numerically on a 910B3 against float64 CPU expectations:
 
-An AIV-only probe returned **numerically exact** output on the card
-(`exp(0)=1.000000`, `exp(1.27)=3.560853`), so the vector path, workspace, launch
-plumbing and build are all genuinely working.
+```
+k_decayed  1.478e-03    q_decayed  1.674e-03
+k_inv      1.785e-03    k_restored 1.734e-03
+g_total    8.962e-07    Mqk        3.851e-03
+INV        1.047e-02
+```
 
-The CPU-side oracle is now **verified**, which it never was before:
-`tests/validate_ref.py` checks torch_ref against an independently written
-unchunked float64 delta-rule loop and passes 5/5 (basic, tail chunk, state,
-varlen, plus the Neumann identity to 1e-14). It found and fixed a real NaN bug
-in torch_ref along the way. So when the kernel does run, the number it is
-measured against can be trusted.
+It also holds up at T=64, H=4 (16 cores), not just the single tile it was
+debugged on.
+
+**Kernel2 is split but its cube phases fault.** It no longer uses cross-core
+handshakes; the chunk loop is on the host and each chunk issues five
+stream-ordered launches. Running it raises an aicore exception, so the forward
+pass still does not complete end to end.
+
+The CPU oracle is verified: `tests/validate_ref.py` passes 5/5 against an
+independently written float64 delta-rule loop, and fixed a real NaN bug in
+torch_ref on the way.
+
+## What was actually wrong (all confirmed on hardware)
+
+Five distinct bugs, in the order they were found:
+
+1. **Cross-core sync does not work from a Python extension.** The identical
+   handshake completes in a standalone binary at any blockDim, with a Resource
+   member, with PipeBarrier — and hangs inside the .so with any argument shape.
+   A kernel without a handshake works fine in that same .so. Ruled out along the
+   way: blockDim, `Catlass::Arch::Resource`, torch's stream, argument size,
+   `aclrtGetHardwareSyncAddr`, and missing link libraries.
+   Fix: split each kernel into single-core-type launches ordered by the stream.
+
+2. **Missing core-type guards.** Splitting dropped the `operator()<AIC>` /
+   `<AIV>` specialization that was implicitly guarding each body. The compiler
+   builds every kernel as a mix binary with `_mix_aic` and `_mix_aiv` halves, so
+   the cube phases ran their L1/L0 code on a vector core — "The MPU address
+   access is invalid".
+   Fix: `if constexpr (g_coreType != AscendC::AIC/AIV) return;` in every phase.
+
+3. **`LoadBt`'s Nd2Nz parameters.** k_inv is `[CHUNK, D]` RowMajor and its
+   transpose is the same bytes as ColumnMajor `[D, CHUNK]`. Nd2Nz describes a
+   ColumnMajor source by its *columns*: `nValue` is the column count and
+   `dValue` the column length. Having them swapped asked for 128 spans of 16 at
+   a 128 pitch, reading to element 16272 of a 2048-element buffer.
+
+4. **`Gemm16`'s `FIX_MTE2` event was unbalanced.** ComputeNeumann chains nine
+   GEMMs, each reloading L1 from the GM the previous Fixpipe wrote. The set had
+   no matching wait, so nine unconsumed events accumulated and the core stalled.
+   Fix: a plain set/wait barrier at the end of each GEMM.
+
+5. **The Neumann iteration squared (I − L) instead of L.** `(I-L)^2` is
+   `I - 2L + L^2`, and the AIV never wrote plain L anywhere. The running product
+   picked up an extra doubling per iteration — the 2³ = 8 that appeared on
+   kINV's diagonal. Fix: the AIV fills L directly in the mask loop and stores it
+   to scratch slot 5.
+
+Two of my own testing bugs are worth recording because they cost real time:
+
+- `struct` has no bfloat16 code, and `'e'` is IEEE fp16. Reading the four bf16
+  workspace fields with `'e'` reinterprets the exponent and made correct data
+  look wrong by factors of 20–500, while fp32 `g_total` passed. bf16 is the top
+  16 bits of the fp32 pattern.
+- The sync script built into `build/` but never installed the `.so` into
+  `flash_kda/`, so two rounds of "identical results" were a stale binary.
+
+## Next
+
+1. **Kernel2's cube phases.** Same class of bug as kernel1: hand-rolled
+   `Nd2NzParams` / `LoadData2DParams`. Start with `GemmAt`, whose `k_res^T`
+   operand needs exactly the ColumnMajor parameterization `LoadBt` turned out to
+   need. Bisect with the phase stubs, as for kernel1.
+2. **Then end-to-end.** `tests/test_npu_nocompute.py` prints `err_ratio` against
+   torch_ref; bf16 should land near 1e-2.
+3. **Then the weak spots in the current verification.** With the test input
+   |L| ≈ 0.028, so `(I+L)^-1 ≈ I` and kINV passing does not strongly exercise
+   the Neumann series — a larger-L input would. And `L` itself differs from
+   float64 by 6e-1 because `k_decayed @ k_inv^T` cancels ~28 orders of
+   magnitude; torch_ref, which does the same bf16 arithmetic, is the fair
+   yardstick there, not float64.
+4. Replacing the hand-rolled descriptors with the catlass tile classes remains
+   the durable cleanup, and would have prevented bugs 3 and (in kernel2)
+   whatever is faulting now.
+
+Beware: `fault kernel_name=` in plog can be stale, since the log accumulates
+across runs. Confirm with `FLASH_KDA_SKIP_K2=1` before believing it.
+
 
 ## Blocked on you: Teleport login
 
