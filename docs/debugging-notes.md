@@ -23,24 +23,51 @@ i.e. the output is essentially uncorrelated with the reference rather than
 imprecise. Kernel1's outputs are all individually verified, so the fault is in
 kernel2's recurrence.
 
-## The next thing to fix, with the derivation done
+## The next thing to fix
 
-kernel2's `Gemm` and `GemmAt` load their B operand from GM as RowMajor→**zN**
-and then issue `LoadData` with `ifTranspose = false`. L0B accepts only two
-source layouts:
+Three separate problems in kernel2. The first was found by reading and needs no
+hardware.
 
-    zZ -> nZ   with ifTranspose = true
-    nZ -> nZ   with ifTranspose = false
+### 1. The recurrence is the wrong formula, and beta is missing entirely
 
-zN with `ifTranspose = false` is neither, which is exactly the shape of bug that
-produces a well-formed-but-wrong operand: no fault, uncorrelated output.
+`beta` appears **zero times** in all of `fwd_kernel2.hpp`. The delta-rule gate
+is not implemented at all. And the `u` being computed is not the right quantity:
 
-Kernel1 does not hit this because `LoadBt` puts its B into L1 as nZ directly via
-the ColumnMajor parameterization. Kernel2's B operands (v, u, the state) are
-genuinely RowMajor `[k, n]`, and viewing them as ColumnMajor would give Bᵀ, not
-B — so they have to go through zZ.
+```
+kernel2:    u = Mqk @ v  -  (INV @ k_dec) @ state
+reference:  u = INV @ ((v - k_dec @ state) * sigmoid(beta))
+```
 
-Derived from `CopyGmToL1<RowMajor, zZ, B1>` and `zZ::MakeLayout`:
+The first term uses `Mqk` where it should use `INV`, and the beta scaling is
+absent. `(INV @ k_dec) @ state` is fine in isolation -- associativity makes it
+equal to `INV @ (k_dec @ state)` -- but it cannot be combined with the other
+term as written. On its own this explains `err_ratio ~ 1`.
+
+The correct decomposition keeps the same five-phase, five-launch shape:
+
+```
+1  AIV   load v and beta; state -> bf16
+2  AIC   t1    = k_dec @ state ;  out_acc = q_dec @ state
+3  AIV   v_sub = (v - t1) * sigmoid(beta)
+4  AIC   u     = INV @ v_sub ;  s8 = Mqk @ u ;  s7 = k_res^T @ u
+5  AIV   out   = out_acc + s8 ;  state = state * g_total + s7
+```
+
+This is what the inherited draft's own comments described; the implementation
+drifted from them.
+
+### 2. The B operand goes through a layout L0B does not accept
+
+L0B accepts only `zZ -> nZ` with `ifTranspose = true`, or `nZ -> nZ` with
+`ifTranspose = false`. kernel2 loads B from GM as RowMajor->zN and issues
+`ifTranspose = false` -- neither. That is the shape of bug that yields a
+well-formed but wrong operand: no fault, uncorrelated output.
+
+Kernel1 avoids it because `LoadBt` writes nZ directly via the ColumnMajor
+parameterization. Kernel2's B operands (v, u, state) are genuinely RowMajor
+`[k, n]`, and a ColumnMajor view gives B-transpose, not B -- so they must go
+through zZ. Derived from `CopyGmToL1<RowMajor, zZ, B1>`, `zZ::MakeLayout` and
+`CopyL1ToL0B<zZ, nZ>`:
 
     GM RowMajor [k, n] -> L1 zZ
       ndNum             = k / 16
@@ -52,27 +79,31 @@ Derived from `CopyGmToL1<RowMajor, zZ, B1>` and `zZ::MakeLayout`:
       dstNzNStride      = zZ.stride(0) / C0 = 16 / 16  = 1
       dstNzMatrixStride = zZ.stride(1)      = roundUp16(n) * 16
 
-    L1 zZ -> L0B nZ   (CopyL1ToL0B<zZ, nZ>)
-      repeatTimes = ceil(n / 16)
-      srcStride   = 1
-      dstGap      = 0
-      ifTranspose = true
+    L1 zZ -> L0B nZ
+      repeatTimes = ceil(n / 16), srcStride = 1, dstGap = 0, ifTranspose = true
       looped over ceil(k / 16) fractal rows, stride roundUp16(n) * 16 both sides
 
-**I implemented exactly this and it hung**, so something in it is still off —
-most likely one of the uint16 stride fields or the L1 slot sizing (`Gemm` puts B
-at `K2L1::kState`, a 32 KB slot; `GemmAt` puts it at `K2L1::kB`, only 4 KB,
-which exactly fits a `[16,128]` tile with no slack). That attempt is reverted;
-the tree is back to the state that runs end to end with wrong numbers.
-`scratchpad/patch_k2_bpath.py` holds the attempt if it is worth resuming rather
-than redoing.
+I implemented exactly this and it hung, so something in it is still off. The
+uint16 stride fields and the exact-fit L1 slots are what I would check first;
+`scratchpad/patch_k2_l1slots.py` widens those slots to 64 KB (untested), and the
+attempt itself is `scratchpad/patch_k2_bpath.py`.
 
-The durable alternative — and probably the faster one now — is to stop
-hand-writing these descriptors and call the catlass tile classes directly
-(`CopyGmToL1`, `CopyL1ToL0A`, `CopyL1ToL0B`, `CopyL0CToGm`), which take layout
-objects and derive every field themselves. Every layout bug in this project so
-far has been a hand-derived stride.
+### 3. Kernel2 hangs regardless of its phase bodies
 
+The phase bisection after the buffer change gives HANG for every variant
+**including v0, where all seven phases return immediately**. So the hang is not
+in any body -- it is the launch structure. Kernel1 issues 4 launches per call
+and works; kernel2 issues `1 + 5*chunks + 1`, which is 22 at T=64.
+
+`tests/probe_launchcount.sh` caps the chunk loop at 0/1/2/4 to find the
+threshold. Two candidates: launch count itself, or argument shape -- kernel2's
+entries take `(FwdParams, int32_t)` while kernel1's take a single `FwdParams`.
+`scratchpad/patch_k2_chunkparam.py` moves the chunk index into `FwdParams` so
+the signatures match, removing that variable (untested).
+
+The durable alternative to all this hand-derived layout work is to call the
+catlass tile classes directly. Every layout bug in this project so far has been
+a hand-derived stride.
 
 ## What was actually wrong (all confirmed on hardware)
 
