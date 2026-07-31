@@ -1,158 +1,137 @@
-# Status
+# FlashKDA-Ascend — status
 
-Last updated: 2026-07-30
+## Where things stand
 
-## Summary
+**The forward pass works and matches the CUDA reference.**
 
-The inherited `FlashKDA-Ascend` port **has never been compiled**. It is a detailed
-sketch of the right algorithm written against an imagined version of the AscendC
-and catlass APIs. Two independent audits — one per kernel, both cross-checked
-against the vendored catlass sources and the CUDA reference — agree that the two
-kernel files need to be rewritten rather than repaired.
+12/12 shape and feature cases pass against `torch_ref` at the bf16 noise floor
+(~1e-2), and 10/10 repeated runs pass with no faults or hangs:
 
-This document records what is actually true about the code, so nobody has to
-rediscover it.
+```
+T=16  H=1  one chunk      6.157e-03    B=2   T=32 H=2        8.516e-03
+T=64  H=4  baseline       7.273e-03    state bf16  out 7.571e-03  state 4.662e-03
+T=48  H=2                 9.727e-03    state fp32  out 7.571e-03  state 4.595e-03
+T=128 H=8                 8.062e-03    varlen [16,24,8] H=1  5.956e-03
+T=80  H=1                 6.487e-03    varlen [32,32]   H=2  1.249e-02
+T=40  H=2  tail 8 rows    7.312e-03
+T=24  H=4  tail 8 rows    7.270e-03
+```
 
-## What the inherited tree claimed vs. what is there
+Sequence lengths 16-128, head counts 1-8, batching, ragged varlen, tail chunks,
+and both state dtypes.
 
-`FlashKDA-Ascend/README.md` and `CLAUDE.md` describe a finished, tuned
-implementation: "Full Implementation", a two-stage pingpong pipeline,
-"template-specialized on 5 boolean flags producing 14 variants", and a table of
-CUDA→Ascend mappings. None of that is backed by the code.
+Kernel1's intermediates are additionally checked field by field against float64:
 
-| Claim | Reality |
+```
+k_decayed 1.478e-03   q_decayed 1.674e-03   k_inv 1.785e-03
+k_restored 1.734e-03  g_total 8.962e-07     Mqk 3.851e-03   INV 3.352e-04
+```
+
+The CPU oracle itself is verified: `tests/validate_ref.py` checks `torch_ref`
+against an independently written float64 delta-rule loop, 5/5.
+
+## Running it
+
+Get a card (see `bringup.md`), then:
+
+```bash
+source /usr/local/Ascend/cann-8.5.0/set_env.sh
+export PATH=/usr/local/python3.11.14/bin:$PATH TORCH_DEVICE_BACKEND_AUTOLOAD=0
+cd /user/zhouyiran/flashkda/FlashKDA-Ascend/build && make -j8 && cp _C*.so ../flash_kda/
+cd .. && PYTHONPATH=$PWD:$PWD/tests python3 tests/test_shapes.py
+```
+
+| Test | What it covers |
 |---|---|
-| Kernels are implemented | ~2000 lines exist; no `__global__` entry point, so nothing can be launched |
-| `src/flash_kda.cpp` does "ACL runtime launch" | It calls `launch_fwd_prepare` / `launch_fwd_recurrence`, whose bodies are entirely comments |
-| 14 template variants on 5 flags | Zero template specialization; the flags are runtime `int` fields. (The sentence also says "5 flags" and then lists 4.) |
-| 2-stage L0C pingpong | L0C is always addressed at offset 0; the pingpong exists only in variable names |
-| Builds with `pip install .` | CMake omits `find_package(ASC)`, so configuration fails before compiling anything |
+| `tests/validate_ref.py` | the CPU oracle, against an independent float64 implementation. No hardware needed. |
+| `tests/check_prepare.py` | kernel1's seven workspace outputs against float64 |
+| `tests/dump_k2_chunk0.py` | kernel2's chunk-0 intermediates, using the device's own Mqk/INV |
+| `tests/per_chunk_err.py` | error broken down per chunk and per head |
+| `tests/test_shapes.py` | the 12 shape and feature cases |
+| `test_npu_nocompute.py` | single end-to-end number |
 
-There were no TODO or WIP markers anywhere to signal this.
+`FLASH_KDA_SKIP_K2=1` runs kernel1 alone. `_C.noop()`, `_C.aiv_only()` and
+`_C.aic_only()` are launch-path probes; `tests/sync_probe.cpp` and
+`tests/aic_resource_probe.cpp` are standalone comparisons.
 
-## Blocking defects, by category
+## Design
 
-### The code cannot compile
+Both kernels are split into single-core-type launches ordered by the stream,
+rather than one kernel with AIC/AIV cross-core handshakes.
 
-- `layout.hpp` used `ArchTag::UBSize`, `L1Size`, `L0ASize`, `L0BSize`, `L0CSize`.
-  The real names in `catlass/include/catlass/arch/arch.hpp` are `UB_SIZE`,
-  `L1_SIZE`, `L0A_SIZE`, `L0B_SIZE`, `L0C_SIZE`. **Fixed.**
-- `layout.hpp` defined `using BF16 = ascendFloat16` with a comment claiming
-  AscendC uses `half` for bf16 on A2. `ascendFloat16` does not exist anywhere in
-  CANN or catlass, and the claim is false — bf16 is `bfloat16_t` and Atlas A2
-  supports it natively, including the Fixpipe `F322BF16` quantization mode.
-  Both kernels then `reinterpret_cast` bf16 pointers to `half*` throughout, which
-  reinterprets an 8-bit exponent as a 5-bit one: garbage, not rounding error.
-  **Fixed in `layout.hpp`; the kernels still need it.**
-- `utils.hpp` functions were plain `inline` but called from `__aicore__` code.
-  **Fixed.**
-- `TBuf<PIPE_V>` / `TBuf<PIPE_MTE1>` — `TBuf`'s parameter is an
-  `AscendC::TPosition`, not a `pipe_t`.
-- `TBuf::GetBufferAddr<T>(offset)` is called ~40 times and does not exist.
-  The catlass equivalent is `Arch::Resource<ArchTag>` plus
-  `LocalTensorBuffer::GetBufferByByte<T>(offset)`.
-- `pipe.InitBuffer(buf, PIPE_X, size)` — the `TBuf` overload takes two arguments.
-- `LocalTensor` has no `operator+`; `v_ub + row * D` must be `v_ub[row * D]`.
-- Namespace-scope explicit specializations of `operator()` without `inline`
-  would multiply-define as soon as two translation units include the header.
+```
+kernel1 (per tile, per head)          kernel2 (per sequence, per head)
+  AIV  prepare                          AIV  InitState
+  AIC  L = k_dec @ k_inv^T, Mqk         per chunk:
+  AIV  tril mask, beta, (I - L)           AIV  BuildU
+  AIC  Neumann inverse                    AIC  PreGemms
+                                          AIV  FinishOut
+                                          AIC  PostGemms
+                                          AIV  FinishChunk
+                                        AIV  StoreFinalState
+```
 
-### The code assumes hardware that does not exist on Atlas A2
+Every phase states its core type with `if constexpr (g_coreType != ...)`: the
+compiler emits both a `_mix_aic` and a `_mix_aiv` half for each kernel, and an
+unguarded body runs on both.
 
-This is the part that makes it a rewrite rather than a repair.
+All inter-phase values travel through GM workspace, which is what made the split
+cheap -- on Atlas A2 the AIC cannot reach UB and L0C drains only to L1 or GM.
 
-- **AIC has no access to UB.** Both kernels have the AIC read and write `ubBuf`,
-  `Fixpipe` into UB tensors, `DataCopy` UB→L1, and even run vector `Add`
-  instructions on the AIC. On A2 the vector unit and UB belong to the AIV.
-  `catlass/include/catlass/gemm/tile/copy_l0c_to_ub.hpp` is wrapped entirely in
-  `#if CATLASS_ARCH == 3510` — the L0C→UB path is Ascend 950 only.
-  Every AIC↔AIV hand-off must go through GM, as it does in
-  `catlass/examples/19_mla` and `23_flash_attention_infer`.
-- **There is no L1↔UB path at all**, in either direction.
-- **AIV block index is a sub-core index.** One AIC pairs with two AIVs, so the
-  AIV must use `GetBlockIdx() / GetSubBlockNum()` to agree with its AIC. As
-  written, the two AIVs compute different tiles than their AIC, and the
-  CrossCore flag counts come out 2:1 — wrong results and a hang.
-- **`SetSyncBaseAddr(hardwareSyncAddr)` is missing.** It must be the first
-  statement of the kernel entry, and the address comes from
-  `aclrtGetHardwareSyncAddr` on the host. Without it every CrossCore
-  set/wait is inert.
-- **Guaranteed deadlock in kernel 1:** the AIV returns early for out-of-range
-  varlen tiles before signalling, while its AIC is already blocked waiting.
-- **Guaranteed deadlock in kernel 2:** `M_FIX` is set once at entry but waited
-  on ~96 times per chunk; `MTE1_MTE2` is waited on every chunk but never set
-  inside the loop.
+## Things that cost real time, worth knowing
 
-### The numerics are wrong even where the code would run
+**Kernel entries must take a single argument.** Five of kernel2's entries took
+`(FwdParams, int32_t)` and hung; the two taking a lone `FwdParams` ran. Moving
+the chunk index into `FwdParams` fixed it. This also invalidated an earlier
+conclusion that cross-core sync does not work from a Python extension -- those
+probes were two-argument too, so the experiment was confounded. Whether
+cross-core sync works with a single-argument entry is untested; the split is a
+reasonable design regardless, but it was not forced by what I thought forced it.
 
-- **Decay exponents are inflated by log2(e) ≈ 1.4427.** The CUDA kernel uses
-  `ex2` (2^x) and folds `log2(e)` into `gate_scale` on the host. The port kept
-  the folded `gate_scale` but switched to the natural `Exp`. **Fixed** by passing
-  the raw `lower_bound` and using `Exp` consistently.
-- **`inv_cumsum` is identically 1.** It aliases `exp_cumsum`, overwrites it with
-  `Duplicate(..., 1.0f)`, then divides that by itself. Decay is silently lost.
-- **`Exp(g_total)` is applied twice** — kernel 1 already exponentiates it before
-  storing, matching the CUDA reference, and kernel 2 exponentiates again.
-- **Phase A and Phase B UB offsets are identical**, so `decay_apply_aiv` reads
-  `q_ub[row]` and writes `k_decayed_ub[row]` at the same address. The CUDA
-  version can union these buffers only because it stages everything through
-  registers first.
-- **`Nd2NzParams` strides are swapped** (`dstNzC0Stride` and `dstNzNStride`).
-- **The zN fractal offset helper is transposed.** It computes a zZ (row-major
-  between fractals) offset. Harmless for the 16-row matrices, silently wrong for
-  the [128,128] state. **Fixed in `utils.hpp`.**
-- **`ifTranspose = true` on a zN source has no corresponding catlass path.**
-  Transposing `k_restored` must be done at the GM→L1 step by loading the same
-  bytes as ColumnMajor→nZ.
-- **16×16 sub-blocks are flat-copied out of a [16,128] RowMajor UB buffer**,
-  which picks up the wrong 256 elements — rows are 128 apart, not contiguous.
-- The recurrent state is stored to GM transposed relative to the reference
-  implementation's `[value, key]` convention.
+**`DataCopyPad` pads every block to 32 bytes.** Gathering one value per token
+with `blockLen = sizeof(bf16)` does not land them contiguously -- they land 16
+elements apart with garbage between. This corrupted the beta load in both
+kernels (`sigmoid(beta)` at rel 6.1e-01, with every downstream quantity
+inheriting it) and the state transpose. Both now copy whole blocks and select
+with scalar reads.
 
-## What was salvageable
+**`M_MTE1` after every `Mmad`.** The cube reads L0A/L0B and the next GEMM's
+`LoadData` overwrites them. Without the barrier the device reports
+`"L0B read/write conflict in the MTE (same address)"` intermittently -- two runs
+in six.
 
-Not everything is wrong, and the algorithm intent is a useful specification:
+**`Nd2Nz` describes a ColumnMajor source by its columns.** `nValue` is the
+column count, `dValue` the column length. Reversed, it read to element 16272 of
+a 2048-element buffer.
 
-- The lower-triangular mask, beta sigmoid, and `(I - L)` construction in
-  kernel 1 match the CUDA reference line for line, including the diagonal
-  handling.
-- The Neumann series decomposition `INV = (I-L)(I+L²)(I+L⁴)(I+L⁸)` is correct.
-- The varlen tile-index derivation matches the reference.
-- The runtime-flag design (rather than 14 template variants) is a reasonable
-  choice — the README is what needs correcting.
-- Accumulating K in fp32 inside L0C and adding the two output terms in bf16
-  both match the reference's precision choices.
+**The Neumann iteration squares L, not (I - L).** `(I-L)^2 = I - 2L + L^2`. The
+symptom was `2^3 = 8` on the inverse's diagonal.
 
-## Current state of this repository
+**No scalar `exp` on the aicore, and scalar bf16 casts are rejected.** Anything
+exponential goes through the vector unit; widen bf16 with `Cast` before reading
+it scalar.
 
-Fixed so far:
+**Exact-fit L0 allocations faulted; architectural sizes fixed it.** But the
+opposite held in kernel2's L1 map, where widening slots to 64 KB broke it. Do
+not generalise either way without measuring.
 
-- `include/flash_kda/layout.hpp` — rewritten: correct arch constants, `bfloat16_t`,
-  GM_ADDR params, workspace extended with AIC↔AIV scratch slots.
-- `include/flash_kda/utils.hpp` — rewritten: `__aicore__` device helpers, correct
-  zN fractal addressing, correct Nd2Nz strides, workspace size derived from
-  `WorkspaceSizes` so host and device cannot drift.
-- `CMakeLists.txt` — rewritten against catlass's own torch-extension template:
-  `find_package(ASC)` before `project()`, catlass as an include directory rather
-  than `add_subdirectory`, `--npu-arch=dav-<arch>`, and linking against torch,
-  torch_npu, `ascendc_runtime`, `runtime`, `ascendcl`, `tiling_api`, `platform`.
+Two of my own testing bugs, since they produced convincing wrong answers:
+`struct` has no bf16 code and `'e'` is IEEE fp16, so reading bf16 workspace
+fields with `'e'` made correct data look wrong by 20-500x; and the sync script
+built into `build/` without installing the `.so`, so two rounds of "identical
+results" were a stale binary.
 
-Still to do:
+## Not done
 
-- `include/flash_kda/fwd_kernel1.hpp` — rewrite.
-- `include/flash_kda/fwd_kernel2.hpp` — rewrite.
-- `src/fwd_kernel1.asc` / `src/fwd_kernel2.asc` — kernel entry points and launch.
-- `src/flash_kda.cpp` — pass the hardware sync address; drop the `is_cuda` naming.
-- `README.md` / `CLAUDE.md` — correct the claims listed at the top of this file.
-
-## Hardware
-
-Development and debugging run on Cybertron's Wulanchabu cluster, which has
-Ascend 910B (Atlas A2, `CATLASS_ARCH=2201`) — the exact target this port was
-written for. HiDevLab is not needed.
-
-Devspace job 645140: 1× 910B3, preemptable, CANN 8.5.0, `bisheng` and `ccec`
-present, `ASCConfig.cmake` available so `find_package(ASC)` resolves.
-
-The working rule from here: **nothing is described as done until it has compiled
-and run on that card.** The state this project was inherited in is what happens
-otherwise.
+- **Performance.** Nothing has been tuned or measured. Kernel2 issues five
+  launches per chunk, the state transpose is a scalar double loop, and there is
+  no double buffering anywhere. Correctness first was the right order, but this
+  is not a fast kernel yet.
+- **The hand-rolled layout descriptors.** `Nd2NzParams`, `LoadData2DParams` and
+  `FixpipeParamsV220` are still written by hand. Every layout bug in this
+  project was a hand-derived stride; the catlass tile classes (`CopyGmToL1`,
+  `CopyL1ToL0A`, `CopyL1ToL0B`, `CopyL0CToGm`) derive them from layout objects
+  and would be the durable cleanup.
+- **Backward pass.** Not started; this is forward only.
+- **Ascend 950 (`CATLASS_ARCH=3510`).** Only 910B has been exercised.
+- **Larger D.** `D == 128` is asserted host-side.
