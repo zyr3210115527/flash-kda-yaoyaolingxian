@@ -29,18 +29,29 @@ End-to-end at T=1024 H=8 started this round at 29.96 ms and is now 2.73 ms.
 
 ## Against the CUDA version
 
-The CUDA implementation's own benchmark, on an H20:
+At the CUDA implementation's own benchmark shapes, which are now reachable --
+they were not before, because the wrapper built the workspace as host-side
+zeros and copied it, and ~20 GB does not go through the host:
 
-| Shape | ms | µs/token/head |
-|---|---:|---:|
-| T=8192 H=64 D=128 fixed | 1.6217 | 0.0031 |
-| T=8192 H=96 D=128 fixed | 2.6220 | 0.0033 |
+| T | H | workspace | ours ms | CUDA/H20 ms | ratio |
+|---:|---:|---:|---:|---:|---:|
+| 8192 | 64 | 18.6 G | 94.53 | 1.6217 | **58×** |
+| 8192 | 96 | 27.9 G | 136.54 | 2.6220 | **52×** |
 
-Roughly **90× slower per token-head**, not the 790× the allocation-dominated
-numbers suggested.
+Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
+about 0.180 from H=64 onward, so this is a stable figure rather than one that
+keeps narrowing with size.
 
-Different hardware (910B vs H20) and different shapes — our workspace does not
-reach T=8192 — so treat this as a scale reference, not a like-for-like result.
+For reference, the same number earlier in this work was 790× — that came from
+a harness where per-call workspace allocation was 88–98% of the measurement.
+Correcting the methodology brought it to ~94×; the optimizations below and
+reaching the matching shape brought it to 58×.
+
+The remaining caveat is the one that cannot be measured away here: different
+silicon. An H20 and a 910B3 are not the same machine, so this is a scale
+reference, not a statement about the two implementations' quality. The
+comparison that would isolate the code from the hardware is a PyTorch baseline
+on this same card, which is what the next section is about.
 
 ## A PyTorch baseline would be the honest comparison, and cannot run here
 
