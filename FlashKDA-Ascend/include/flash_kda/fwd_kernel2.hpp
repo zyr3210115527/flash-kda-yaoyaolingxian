@@ -37,6 +37,7 @@ namespace flash_kda {
 
 
 // UB map, AIV only.
+// K2_BETA_SLOT: scratch slot 1 carries sigmoid(beta) between phases.
 struct K2Ub {
     static constexpr uint32_t kV      = 0;                      // [16,128] bf16
     static constexpr uint32_t kU      = kV + CHUNK * D * 2;      // [16,128] bf16
@@ -448,6 +449,55 @@ private:
         wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
         AscendC::DataCopy(wsB[Slot(params, tileIdx, headIdx, 2) / 2], vb, CHUNK * D);
 
+        // sigmoid(beta) for this chunk's rows, into slot 1 as fp32. FinishOut
+        // needs it and runs as a separate launch, so it has to go through GM.
+        // beta is [T_total, H]: this chunk's values start at the first token
+        // and repeat every H elements.
+        {
+            auto braw = bufs.template Ub<BF16>(K2Ub::kBeta);
+            auto bsig = bufs.template Ub<float>(K2Ub::kBeta + 64);
+            auto bwrk = bufs.template Ub<float>(K2Ub::kBeta + 64 + 128);
+
+            AscendC::GlobalTensor<BF16> gmBeta;
+            gmBeta.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.beta));
+            const int64_t betaOff = tokenBase * params.H + headIdx;
+
+            AscendC::Duplicate(braw, static_cast<BF16>(0), CHUNK);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>((event_t)7);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((event_t)7);
+
+            AscendC::DataCopyExtParams bp{
+                static_cast<uint16_t>(len),
+                static_cast<uint32_t>(sizeof(BF16)),
+                static_cast<uint32_t>((params.H - 1) * sizeof(BF16)),
+                0, 0};
+            AscendC::DataCopyPadExtParams<BF16> bpad{false, 0, 0, static_cast<BF16>(0)};
+            AscendC::DataCopyPad(braw, gmBeta[betaOff], bp, bpad);
+
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)7);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)7);
+            AscendC::Cast(bsig, braw, AscendC::RoundMode::CAST_NONE, CHUNK);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // sigmoid(x) = 1 / (1 + exp(-x)); no scalar exp on the aicore.
+            AscendC::Muls(bwrk, bsig, -1.0f, CHUNK);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Exp(bwrk, bwrk, CHUNK);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(bwrk, bwrk, 1.0f, CHUNK);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate(bsig, 1.0f, CHUNK);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div(bsig, bsig, bwrk, CHUNK);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::GlobalTensor<float> wsF;
+            wsF.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)7);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)7);
+            AscendC::DataCopy(wsF[Slot(params, tileIdx, headIdx, 1) / 4], bsig, CHUNK);
+        }
+
         StateToBf16(bufs, params, tileIdx, headIdx);
     }
 
@@ -489,13 +539,39 @@ private:
         wsF.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
         wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
 
+        // a = k_dec @ state (fp32 from the cube); b reused for v as fp32.
         AscendC::DataCopy(a, wsF[Slot(params, tileIdx, headIdx, 4) / 4], CHUNK * D);
-        AscendC::DataCopy(b, wsF[Slot(params, tileIdx, headIdx, 5) / 4], CHUNK * D);
+        {
+            auto vb = bufs.template Ub<BF16>(K2Ub::kV);
+            AscendC::GlobalTensor<BF16> wsBv;
+            wsBv.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+            AscendC::DataCopy(vb, wsBv[Slot(params, tileIdx, headIdx, 2) / 2], CHUNK * D);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)8);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)8);
+            AscendC::Cast(b, vb, AscendC::RoundMode::CAST_NONE, CHUNK * D);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)2);
 
-        AscendC::Sub(a, a, b, CHUNK * D);
+        // v_sub = (v - k_dec@state) * sigmoid(beta), row-broadcast.
+        AscendC::Sub(a, b, a, CHUNK * D);
         AscendC::PipeBarrier<PIPE_V>();
+        {
+            auto bsig = bufs.template Ub<float>(K2Ub::kBeta + 64);
+            AscendC::GlobalTensor<float> wsFb;
+            wsFb.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+            AscendC::DataCopy(bsig, wsFb[Slot(params, tileIdx, headIdx, 1) / 4], CHUNK);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>((event_t)8);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>((event_t)8);
+            for (int r = 0; r < CHUNK; ++r) {
+                const float bs = bsig.GetValue(r);
+                AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)8);
+                AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)8);
+                AscendC::Muls(a[r * D], a[r * D], bs, D);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
         AscendC::Cast(ub, a, AscendC::RoundMode::CAST_RINT, CHUNK * D);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)2);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)2);
@@ -621,15 +697,14 @@ private:
         const int64_t v = Slot(params, tileIdx, headIdx, 2);
         const int64_t state = Slot(params, tileIdx, headIdx, 3);
 
-        // Mqk[16,16] @ v[16,128]
-        Gemm(bufs, params, mqk, v, Slot(params, tileIdx, headIdx, 4), CHUNK, D, CHUNK, false);
-        // INV[16,16] @ k_dec[16,128] -> slot0 as bf16, then @ state[128,128]
-        Gemm(bufs, params, inv, kdec, Slot(params, tileIdx, headIdx, 0), CHUNK, D, CHUNK, true);
-        Gemm(bufs, params, Slot(params, tileIdx, headIdx, 0), state,
-             Slot(params, tileIdx, headIdx, 5), CHUNK, D, D, false);
-        // q_dec[16,128] @ state[128,128]
+        // s4 = k_dec @ state, the delta-rule prediction to subtract from v.
+        Gemm(bufs, params, kdec, state, Slot(params, tileIdx, headIdx, 4), CHUNK, D, D, false);
+        // s6 = q_dec @ state, the first half of out.
         Gemm(bufs, params, qdec, state, Slot(params, tileIdx, headIdx, 6), CHUNK, D, D, false);
         (void)seqIdx;
+        (void)mqk;
+        (void)inv;
+        (void)v;
     }
 
     // Round 2: slot8 = Mqk @ u, slot7 = k_res^T @ u.
@@ -640,10 +715,14 @@ private:
         const int64_t kres = Ws(params, tileIdx, headIdx, WorkspaceOffsets::kKRestored);
         const int64_t u = Slot(params, tileIdx, headIdx, 2);
 
-        Gemm(bufs, params, mqk, u, Slot(params, tileIdx, headIdx, 8), CHUNK, D, CHUNK, false);
+        // u = INV @ v_sub, written as bf16 so the next two GEMMs can read it.
+        const int64_t uu = Slot(params, tileIdx, headIdx, 0);
+        Gemm(bufs, params, Ws(params, tileIdx, headIdx, WorkspaceOffsets::kINV), u,
+             uu, CHUNK, D, CHUNK, true);
+        Gemm(bufs, params, mqk, uu, Slot(params, tileIdx, headIdx, 8), CHUNK, D, CHUNK, false);
         // k_res^T[128,16] @ u[16,128]: the transpose comes from reading k_res's
         // RowMajor bytes as ColumnMajor, not from any data movement.
-        GemmAt(bufs, params, kres, u, Slot(params, tileIdx, headIdx, 7));
+        GemmAt(bufs, params, kres, uu, Slot(params, tileIdx, headIdx, 7));
         (void)seqIdx;
     }
 
