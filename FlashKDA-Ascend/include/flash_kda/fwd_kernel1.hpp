@@ -77,7 +77,10 @@ struct K1L1 {
     static constexpr uint32_t kB      = kA + CHUNK * D * 2;
     static constexpr uint32_t kSmallA = kB + CHUNK * D * 2;
     static constexpr uint32_t kSmallB = kSmallA + 512;
-    static constexpr uint32_t kEnd    = kSmallB + 512;
+    // Second B operand for Gemm16Fused. A 16x16 bf16 tile is 512 bytes and L1
+    // is 512 KB, so this costs nothing worth counting.
+    static constexpr uint32_t kSmallC = kSmallB + 512;
+    static constexpr uint32_t kEnd    = kSmallC + 512;
 };
 static_assert(K1L1::kEnd < ArchTag::L1_SIZE, "kernel1 L1 budget exceeded");
 
@@ -178,13 +181,10 @@ public:
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        // grid-stride: one block per core, looping over units, rather than one
-        // block per (tile, head). Dispatching 512 blocks cost more than the
-        // work they did.
-        const int units = params.total_tiles * params.H;
-        const uint32_t stride = AscendC::GetBlockNum();
-        for (uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
         if (AscendC::GetSubBlockIdx() != 0) {
             return;
         }
@@ -195,7 +195,6 @@ public:
             K1AivBufs bufs;
             Prepare(bufs, params, headIdx, span);
         }
-        }
     }
 
     CATLASS_DEVICE void RunLMqk(Params const& params)
@@ -203,18 +202,16 @@ public:
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
-        // grid-stride; see the AIV phases.
-        const int units = params.total_tiles * params.H;
-        const uint32_t stride = AscendC::GetBlockNum();
-        for (uint32_t coreIdx = AscendC::GetBlockIdx();
-             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+        const uint32_t coreIdx = AscendC::GetBlockIdx();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
         const int headIdx = static_cast<int>(coreIdx) % params.H;
         TileSpan span;
         ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
         if (span.valid) {
             K1AicBufs bufs;
             ComputeLAndMqk(bufs, params, headIdx, span);
-        }
         }
     }
 
@@ -223,13 +220,10 @@ public:
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        // grid-stride: one block per core, looping over units, rather than one
-        // block per (tile, head). Dispatching 512 blocks cost more than the
-        // work they did.
-        const int units = params.total_tiles * params.H;
-        const uint32_t stride = AscendC::GetBlockNum();
-        for (uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
         if (AscendC::GetSubBlockIdx() != 0) {
             return;
         }
@@ -240,7 +234,6 @@ public:
             K1AivBufs bufs;
             MaskAndBuild(bufs, params, headIdx, span);
         }
-        }
     }
 
     CATLASS_DEVICE void RunNeumann(Params const& params)
@@ -248,18 +241,16 @@ public:
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
-        // grid-stride; see the AIV phases.
-        const int units = params.total_tiles * params.H;
-        const uint32_t stride = AscendC::GetBlockNum();
-        for (uint32_t coreIdx = AscendC::GetBlockIdx();
-             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+        const uint32_t coreIdx = AscendC::GetBlockIdx();
+        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
+            return;
+        }
         const int headIdx = static_cast<int>(coreIdx) % params.H;
         TileSpan span;
         ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
         if (span.valid) {
             K1AicBufs bufs;
             ComputeNeumann(bufs, params, headIdx, span);
-        }
         }
     }
 
@@ -844,6 +835,17 @@ private:
 
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)0);
+
+        // Without this, only the LAST Gemm128 issued before the kernel ends
+        // produces reliable GM data; every earlier one is non-deterministic.
+        // Three experiments pinned it down: swapping the two calls moved the
+        // corruption to whichever ran first, issuing the same call twice left
+        // it corrupt, and the surviving raw fp32 output showed uninitialized
+        // memory rather than wrong arithmetic. The Fixpipe write had not
+        // retired before the next call's MTE2 traffic began. Gemm16 already
+        // carries this barrier; Gemm128 was missing it.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)1);
     }
 
     // ---------------- AIC round 2: Neumann inverse ----------------
@@ -861,31 +863,125 @@ private:
     // Squaring is sign-safe: (I - L) carries -L below the diagonal and
     // (-L)^2 = L^2, so squaring slot 0's strictly-lower part gives L^2.
     CATLASS_DEVICE
+    // dst = A*B1 + A*B2, in one pass through the cube.
+    //
+    // Every factor of the Neumann series is P*(I + L^k), which expands to
+    // P*I + P*L^k. Done as two Gemm16 calls that is two GM round trips plus a
+    // third to copy the result back; done here it is one, because the L0C
+    // accumulator holds the partial sum between the two Mmads and A stays
+    // resident in L0A.
+    void Gemm16Fused(K1AicBufs& bufs, Params const& params, int64_t aByte,
+                     int64_t b1Byte, int64_t b2Byte, int64_t dstByte)
+    {
+        AscendC::GlobalTensor<BF16> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+
+        auto l1A = bufs.template L1<BF16>(K1L1::kSmallA);
+        auto l1B = bufs.template L1<BF16>(K1L1::kSmallB);
+        auto l1C = bufs.template L1<BF16>(K1L1::kSmallC);
+        auto l0A = bufs.template L0A<BF16>();
+        auto l0B = bufs.template L0B<BF16>();
+        auto l0C = bufs.template L0C<float>();
+
+        AscendC::Nd2NzParams p;
+        p.ndNum = 1;
+        p.nValue = CHUNK;
+        p.dValue = CHUNK;
+        p.srcNdMatrixStride = 0;
+        p.srcDValue = CHUNK;
+        p.dstNzC0Stride = CHUNK;
+        p.dstNzNStride = 1;
+        p.dstNzMatrixStride = 0;
+        AscendC::DataCopy(l1A, gm[aByte / 2], p);
+        AscendC::DataCopy(l1B, gm[b1Byte / 2], p);
+        AscendC::DataCopy(l1C, gm[b2Byte / 2], p);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = 1;
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = false;
+        AscendC::LoadData(l0A, l1A, ld);
+        AscendC::LoadData(l0B, l1B, ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        AscendC::MmadParams mp;
+        mp.m = CHUNK;
+        mp.n = CHUNK;
+        mp.k = CHUNK;
+        mp.cmatrixInitVal = true;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        // The cube must finish reading L0B before MTE1 overwrites it with the
+        // second operand -- the same "L0B read/write conflict in the MTE" that
+        // Gemm16 guards against, and here the reload is immediate.
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+
+        // L0A still holds A; only B changes.
+        AscendC::LoadData(l0B, l1C, ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        mp.cmatrixInitVal = false;   // accumulate onto A*B1 already in L0C
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+
+        AscendC::FixpipeParamsV220 fp;
+        fp.nSize = CHUNK;
+        fp.mSize = CHUNK;
+        fp.srcStride = CHUNK;
+        fp.dstStride = CHUNK;
+        fp.quantPre = QuantMode_t::F322BF16;
+        AscendC::GlobalTensor<BF16> out;
+        out.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+        AscendC::Fixpipe<BF16, float, AscendC::CFG_ROW_MAJOR>(out[dstByte / 2], l0C, fp);
+
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)1);
+
+        // The next call reloads L1 from the GM this Fixpipe just wrote.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+    }
+
     void ComputeNeumann(K1AicBufs& bufs, Params const& params, int headIdx, TileSpan const& span)
     {
-        const int64_t a = Slot(span, headIdx, 0);   // (I - L)
-        const int64_t l = Slot(span, headIdx, 2);   // L^(2^j)
-        const int64_t t = Slot(span, headIdx, 3);   // temp
-        const int64_t p = Slot(span, headIdx, 4);   // running product
+        const int64_t imL   = Slot(span, headIdx, 0);   // (I - L)
+        const int64_t lbase = Slot(span, headIdx, 5);   // L itself
+        const int64_t inv   = Ws(span, headIdx, WorkspaceOffsets::kINV);
         const int64_t ident = Ws(span, headIdx, WorkspaceOffsets::kIdentity);
 
-        // L itself, from slot 5. Squaring (I - L) would give I - 2L + L^2.
-        const int64_t lbase = Slot(span, headIdx, 5);
-        Gemm16(bufs, params, lbase, lbase, l, true, true);   // L^2
-        Gemm16(bufs, params, a, ident, p, true, true);    // P <- (I - L)
+        // (I + L)^-1 = (I - L)(I + L^2)(I + L^4)(I + L^8), with L strictly
+        // lower triangular so the series terminates.
+        //
+        // The L powers alternate between slots 2 and 3 and the running product
+        // between the unused slots 6 and 7, so nothing is ever copied back to
+        // a fixed location. Squaring (I - L) instead of L would give
+        // I - 2L + L^2, which is why L is kept separately in slot 5.
+        const int64_t lA = Slot(span, headIdx, 2);
+        const int64_t lB = Slot(span, headIdx, 3);
+        const int64_t pA = Slot(span, headIdx, 6);
+        const int64_t pB = Slot(span, headIdx, 7);
 
-        for (int j = 0; j < 3; ++j) {
-            Gemm16(bufs, params, p, ident, t, true, true);   // T <- P
-            Gemm16(bufs, params, p, l, t, false, true);      // T <- P + P*L^(2^(j+1))
-            Gemm16(bufs, params, t, ident, p, true, true);   // P <- T
-            if (j < 2) {
-                Gemm16(bufs, params, l, l, t, true, true);   // L <- L^2
-                Gemm16(bufs, params, t, ident, l, true, true);
-            }
-        }
-
-        // P is the inverse; publish it.
-        Gemm16(bufs, params, p, ident, Ws(span, headIdx, WorkspaceOffsets::kINV), true, true);
+        Gemm16(bufs, params, lbase, lbase, lA, true, true);   // L^2
+        Gemm16Fused(bufs, params, imL, ident, lA, pA);        // (I-L)(I + L^2)
+        Gemm16(bufs, params, lA, lA, lB, true, true);         // L^4
+        Gemm16Fused(bufs, params, pA, ident, lB, pB);         // ... (I + L^4)
+        Gemm16(bufs, params, lB, lB, lA, true, true);         // L^8
+        Gemm16Fused(bufs, params, pB, ident, lA, inv);        // ... (I + L^8)
     }
 
     // 16x16x16 MMAD over bf16 GM scratch. bf16Out selects Fixpipe's F322BF16
