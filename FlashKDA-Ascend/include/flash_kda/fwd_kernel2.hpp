@@ -277,6 +277,62 @@ public:
         DecayState(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
     }
 
+    // FinishChunk for chunk t, then BuildU for chunk t+1, in one launch.
+    //
+    // Kernel2 is 79% launch overhead (322 launches at ~5.7 us; all five phases
+    // together cost 0.49 ms). The per-chunk chain
+    //
+    //     PreGemms (AIC) -> FinishOut (AIV) -> PostGemms (AIC) -> FinishChunk (AIV)
+    //
+    // alternates core type at every arrow, so those four boundaries are forced
+    // while cross-core sync is unavailable. But BuildU of the next chunk is AIV
+    // and already runs immediately after FinishChunk, so that one boundary buys
+    // nothing.
+    //
+    // This does not reorder anything: BuildU still runs after DecayState has
+    // produced the state it reads via StateToBf16, exactly as before. Only the
+    // launch between them is gone. An earlier attempt hoisted BuildU out of the
+    // loop entirely, which broke every multi-chunk shape precisely because it
+    // moved that read away from the state that feeds it.
+    CATLASS_DEVICE
+    void RunFinishChunkAndBuildNext(Params const& params)
+    {
+        const int chunk = params.chunk_idx;
+        if constexpr (g_coreType != AscendC::AIV) {
+            return;
+        }
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
+        SeqSpan sp = Locate(params, true);
+        if (!sp.valid || chunk >= sp.nTiles) {
+            return;
+        }
+        int len = sp.seqLen - chunk * CHUNK;
+        if (len > CHUNK) {
+            len = CHUNK;
+        }
+        const int tileIdx = sp.tileBase + chunk;
+
+        K2AivBufs bufs;
+        StoreOut(bufs, params, sp.headIdx, tileIdx, sp.bos + chunk * CHUNK, len);
+        DecayState(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
+
+        if (chunk + 1 < sp.nTiles) {
+            // These were separate launches, so neither carries a barrier at its
+            // boundary; back to back in one launch the UB buffers they share
+            // need one.
+            AscendC::PipeBarrier<PIPE_ALL>();
+
+            int nlen = sp.seqLen - (chunk + 1) * CHUNK;
+            if (nlen > CHUNK) {
+                nlen = CHUNK;
+            }
+            BuildU(bufs, params, sp.headIdx, tileIdx + 1,
+                   sp.bos + (chunk + 1) * CHUNK, nlen);
+        }
+    }
+
     CATLASS_DEVICE
     void RunStoreFinalState(Params const& params)
     {
