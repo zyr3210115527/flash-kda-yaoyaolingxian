@@ -8,6 +8,42 @@ except ImportError:
 from flash_kda._C import fwd as _fwd_raw, get_workspace_size
 
 
+# Reused across calls, allocated on device, and deliberately not zeroed.
+#
+# This used to be `torch.zeros(...).to(device)` on every call. At T=1024 H=8
+# that is 302 MB of host-side zeros copied to the device per call, and it
+# measured as 88-98% of end-to-end time -- the kernel itself is 2.81 ms, the
+# wrapper made it 29.96 ms.
+#
+# The zeroing was there in case some slot were read before being written, which
+# would make results depend on whatever was in device memory. tests/
+# workspace_poison.py checks that directly: it runs with the workspace filled
+# with 0xFF and with 0x5A and compares against the zeroed run. 0xFF is NaN as
+# bf16, so anything reading uninitialized workspace propagates NaN into the
+# output rather than a small perturbation that might pass unnoticed. Output is
+# bit-identical at T=64 H=4, 256 H=8 and 1024 H=8, so nothing is read before it
+# is written and neither the zeroing nor the host copy is needed.
+#
+# Not thread-safe: concurrent calls on one device would share the buffer. Call
+# clear_workspace_cache() to release it.
+_WS_CACHE = {}
+
+
+def _workspace(nbytes, device):
+    key = (device.type, device.index)
+    buf = _WS_CACHE.get(key)
+    if buf is None or buf.numel() < nbytes:
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _WS_CACHE[key] = buf
+    return buf[:nbytes]
+
+
+def clear_workspace_cache():
+    """Release cached workspaces. Call between very different shapes to give
+    the memory back, or before measuring peak memory."""
+    _WS_CACHE.clear()
+
+
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
         initial_state=None, final_state=None, cu_seqlens=None):
     """FlashKDA forward (Flash Kimi Delta Attention) on Ascend NPU.
@@ -42,15 +78,7 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
     T_total = B * T_seq
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
 
-    # Zeroed, not empty. The kernels write most of the workspace before reading
-    # it, but any slot read before being written would otherwise pick up
-    # whatever was in device memory -- which makes results vary run to run and
-    # is exactly the kind of bug that is painful to find later. Zeros are
-    # produced on the host and copied, because torch_npu's fill needs an
-    # operator kernel that some CANN images do not ship.
-    workspace = torch.zeros(
-        get_workspace_size(T_total, H, N), dtype=torch.uint8
-    ).to(q.device)
+    workspace = _workspace(get_workspace_size(T_total, H, N), q.device)
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
              initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
