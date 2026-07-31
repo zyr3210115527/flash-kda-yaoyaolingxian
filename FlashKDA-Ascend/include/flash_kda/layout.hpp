@@ -184,6 +184,11 @@ struct FwdParams {
     int N;
     int total_tiles;
 
+    // FFTS sync base, from aclrtGetHardwareSyncAddr. Carried here rather than
+    // as a second kernel argument: entries taking two arguments hang, which is
+    // what confounded the original cross-core sync experiment.
+    uint64_t sync_base_addr;
+
     // Which chunk kernel2's phase kernels should process. Carried in params
     // rather than as a second kernel argument so kernel2's entries have the
     // same single-argument signature as kernel1's, which is the shape known to

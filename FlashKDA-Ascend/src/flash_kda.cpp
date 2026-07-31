@@ -243,7 +243,18 @@ int64_t aic_only(at::Tensor flag) {
     return 0;
 }
 
+int64_t sync_onearg(int64_t n, int64_t h) {
+    FwdParams params{};
+    params.N = int(n);
+    params.H = int(h);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
+    flash_kda::launch_sync_onearg(params, stream);
+    return 0;
+}
+
 PYBIND11_MODULE(_C, m) {
+    m.def("sync_onearg", &sync_onearg, "single-argument cross-core handshake probe",
+          py::arg("n"), py::arg("h"));
     m.def("aic_only", &aic_only, "AIC-only probe", py::arg("flag"));
     m.def("aiv_only", &aiv_only, "AIV-only vector kernel probe",
           py::arg("src"), py::arg("dst"));
