@@ -178,10 +178,13 @@ public:
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
+        // grid-stride: one block per core, looping over units, rather than one
+        // block per (tile, head). Dispatching 512 blocks cost more than the
+        // work they did.
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
         if (AscendC::GetSubBlockIdx() != 0) {
             return;
         }
@@ -192,6 +195,7 @@ public:
             K1AivBufs bufs;
             Prepare(bufs, params, headIdx, span);
         }
+        }
     }
 
     CATLASS_DEVICE void RunLMqk(Params const& params)
@@ -199,16 +203,18 @@ public:
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
+        // grid-stride; see the AIV phases.
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
         const int headIdx = static_cast<int>(coreIdx) % params.H;
         TileSpan span;
         ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
         if (span.valid) {
             K1AicBufs bufs;
             ComputeLAndMqk(bufs, params, headIdx, span);
+        }
         }
     }
 
@@ -217,10 +223,13 @@ public:
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
+        // grid-stride: one block per core, looping over units, rather than one
+        // block per (tile, head). Dispatching 512 blocks cost more than the
+        // work they did.
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
         if (AscendC::GetSubBlockIdx() != 0) {
             return;
         }
@@ -231,6 +240,7 @@ public:
             K1AivBufs bufs;
             MaskAndBuild(bufs, params, headIdx, span);
         }
+        }
     }
 
     CATLASS_DEVICE void RunNeumann(Params const& params)
@@ -238,16 +248,18 @@ public:
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
+        // grid-stride; see the AIV phases.
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
         const int headIdx = static_cast<int>(coreIdx) % params.H;
         TileSpan span;
         ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
         if (span.valid) {
             K1AicBufs bufs;
             ComputeNeumann(bufs, params, headIdx, span);
+        }
         }
     }
 
