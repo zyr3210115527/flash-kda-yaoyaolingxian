@@ -801,8 +801,10 @@ private:
         }
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)0);
-        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
-        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)1);
+        // Gemm and GemmAt already open with a self-consuming FIX_MTE2 barrier
+        // before reloading L1, so setting the events again here only leaks
+        // them: two per GEMM, never waited on. That is the same imbalance that
+        // stalled kernel1's Neumann chain.
     }
 };
 
