@@ -101,6 +101,25 @@ entries take `(FwdParams, int32_t)` while kernel1's take a single `FwdParams`.
 `scratchpad/patch_k2_chunkparam.py` moves the chunk index into `FwdParams` so
 the signatures match, removing that variable (untested).
 
+### A fallback if the launch count is the cause
+
+If `probe_launchcount.sh` shows the hang scales with launches, the five-per-chunk
+structure is not viable and there is no way to shrink it: the recurrence is
+sequential in chunks and each chunk genuinely alternates AIV/AIC four times.
+
+The escape is to stop alternating. Run the whole of kernel2 as a **single
+AIV-only kernel** with the chunk loop inside it, doing the GEMMs on the vector
+unit. For D = 128 a `[16,128] @ [128,128]` product is 262144 MACs, which the
+vector unit can do correctly, just slowly. That is one launch instead of
+5*chunks, needs no cross-core sync, and no cube layouts at all -- so it sidesteps
+the B-operand problem too.
+
+It would be markedly slower than the cube, which matters eventually. But it
+would give a correct forward pass to measure against, and the cube path can be
+reintroduced afterwards with a known-good reference to diff against. Getting
+something numerically right first is worth more here than keeping the fast
+structure that has never produced a correct number.
+
 The durable alternative to all this hand-derived layout work is to call the
 catlass tile classes directly. Every layout bug in this project so far has been
 a hand-derived stride.
