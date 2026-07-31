@@ -45,7 +45,7 @@ struct K2Ub {
     static constexpr uint32_t kF32B   = kF32A + CHUNK * D * 4;   // [16,128] f32
     static constexpr uint32_t kGTotal = kF32B + CHUNK * D * 4;   // [128] f32
     static constexpr uint32_t kBeta   = kGTotal + D * 4;         // [16] f32
-    static constexpr uint32_t kStateA = kBeta + 64;              // [128,128] f32 row block
+    static constexpr uint32_t kStateA = kBeta + 2048;              // [128,128] f32 row block
     static constexpr uint32_t kStateB = kStateA + D * D * 4;
     static constexpr uint32_t kScalar = kStateB + D * D * 4;
     static constexpr uint32_t kEnd    = kScalar + 256;
@@ -483,18 +483,29 @@ private:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>((event_t)7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((event_t)7);
 
-            AscendC::DataCopyExtParams bp{
-                static_cast<uint16_t>(len),
-                static_cast<uint32_t>(sizeof(BF16)),
-                static_cast<uint32_t>((params.H - 1) * sizeof(BF16)),
-                0, 0};
-            AscendC::DataCopyPadExtParams<BF16> bpad{false, 0, 0, static_cast<BF16>(0)};
-            AscendC::DataCopyPad(braw, gmBeta[betaOff], bp, bpad);
+            // beta is [T_total, H]: this chunk's rows are len*H contiguous
+            // elements starting at the first token. Copy the block whole --
+            // a strided DataCopyPad of one element per token does not work,
+            // because DataCopyPad pads each block to a 32-byte datablock and
+            // the values would land 16 elements apart with garbage between.
+            const int nRaw = CHUNK * params.H;
+            AscendC::DataCopy(braw, gmBeta[tokenBase * params.H], nRaw);
 
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)7);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)7);
-            AscendC::Cast(bsig, braw, AscendC::RoundMode::CAST_NONE, CHUNK);
+            auto bwide = bufs.template Ub<float>(K2Ub::kBeta + 64 + 256);
+            AscendC::Cast(bwide, braw, AscendC::RoundMode::CAST_NONE, nRaw);
             AscendC::PipeBarrier<PIPE_V>();
+
+            // Pick this head's column. Scalar float reads are fine; only
+            // scalar bf16 casts are rejected, which is why the cast came first.
+            AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)7);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)7);
+            for (int r = 0; r < CHUNK; ++r) {
+                bsig.SetValue(r, (r < len) ? bwide.GetValue(r * params.H + headIdx) : 0.0f);
+            }
+            AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)7);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)7);
 
             // sigmoid(x) = 1 / (1 + exp(-x)); no scalar exp on the aicore.
             AscendC::Muls(bwrk, bsig, -1.0f, CHUNK);
@@ -841,12 +852,20 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
 
         AscendC::LoadData2DParams la;
+        // Matches CopyL1ToL0A<nZ -> zZ> exactly: one repeat per destination
+        // column fractal, issued once per destination row fractal, rather than
+        // a single call with repeatTimes covering both. The two coincide only
+        // if the fractals happen to be contiguous in both, which is not
+        // something to rely on.
+        //   A is [D, CHUNK]: dst zZ stride(1) = 16*16 = 256, src nZ the same.
         la.startIndex = 0;
-        la.srcStride = 1;
-        la.dstGap = 0;
+        la.srcStride = 1;                       // src nZ stride(3)/256 = 1
+        la.dstGap = 0;                          // dst zZ stride(3)/256 - 1 = 0
         la.ifTranspose = true;
-        la.repeatTimes = (D / 16) * (CHUNK / 16);
-        AscendC::LoadData(l0A, l1A, la);
+        la.repeatTimes = CHUNK / C0_NUM_PER_FRACTAL;   // ceil(16/16) = 1
+        for (int i = 0; i < D / C0_NUM_PER_FRACTAL; ++i) {
+            AscendC::LoadData(l0A[i * 256], l1A[i * 256], la);
+        }
 
         LoadBL1ToL0B(l0B, l1B, CHUNK, D);
 

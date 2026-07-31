@@ -67,7 +67,7 @@ struct K1Ub {
     static constexpr uint32_t kSmallB = kSmallA + 512;
     static constexpr uint32_t kReduce = kSmallB + 512;
     static constexpr uint32_t kScalar = kReduce + 1024;
-    static constexpr uint32_t kEnd    = kScalar + 256;
+    static constexpr uint32_t kEnd    = kScalar + 2048;
 };
 static_assert(K1Ub::kEnd < ArchTag::UB_SIZE, "kernel1 UB budget exceeded");
 
@@ -599,18 +599,27 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>((event_t)3);
 
         // blockCount rows of one bf16 each, srcStride skipping the other heads.
-        AscendC::DataCopyExtParams bp{
-            static_cast<uint16_t>(span.actualLen),
-            static_cast<uint32_t>(sizeof(BF16)),
-            static_cast<uint32_t>((params.H - 1) * sizeof(BF16)),
-            0, 0};
-        AscendC::DataCopyPadExtParams<BF16> bpad{false, 0, 0, static_cast<BF16>(0)};
-        AscendC::DataCopyPad(braw, gmBeta[betaOff], bp, bpad);
+        // Copy the [CHUNK, H] block whole rather than gathering one element
+        // per token: DataCopyPad pads each block to 32 bytes, so a strided
+        // one-element-per-block copy lands the values 16 apart with garbage
+        // between them.
+        const int nRaw = CHUNK * params.H;
+        AscendC::DataCopy(braw, gmBeta[span.tokenBase * params.H], nRaw);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
-        AscendC::Cast(bsig, braw, AscendC::RoundMode::CAST_NONE, CHUNK);
+        auto bwide = bufs.template Ub<float>(K1Ub::kScalar + 64);
+        AscendC::Cast(bwide, braw, AscendC::RoundMode::CAST_NONE, nRaw);
         AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)6);
+        for (int r = 0; r < CHUNK; ++r) {
+            bsig.SetValue(r, (r < span.actualLen)
+                                 ? bwide.GetValue(r * params.H + headIdx) : 0.0f);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)6);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)6);
         Sigmoid(bufs, bsig, bwrk, CHUNK);
         AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)4);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)4);
