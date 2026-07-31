@@ -30,15 +30,12 @@
 
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/resource.hpp"
-#include "catlass/arch/cross_core_sync.hpp"
 #include <type_traits>
 
 #include "kernel_operator.h"
 
 namespace flash_kda {
 
-constexpr Catlass::Arch::FlagID K2_ELEM_READY = 3;
-constexpr Catlass::Arch::FlagID K2_MMA_READY = 4;
 
 // UB map, AIV only.
 struct K2Ub {
@@ -72,102 +69,161 @@ public:
     CATLASS_DEVICE
     FwdRecurrenceKernel() {}
 
-    template <int32_t CORE_TYPE = g_coreType>
-    CATLASS_DEVICE void operator()(Params const& params);
+    // Phase entry points. Each is launched separately and ordered by the
+    // stream; there are no cross-core flags, because those deadlock when the
+    // kernel comes from a Python extension (docs/debugging-notes.md). The chunk
+    // index arrives as an argument since the block index encodes only
+    // (sequence, head).
+    //
+    // Every phase must state its core type: the compiler emits both a _mix_aic
+    // and a _mix_aiv half for each kernel, and an unguarded body runs on both.
 
-    template <>
-    CATLASS_DEVICE void operator()<AscendC::AIV>(Params const& params)
+    struct SeqSpan {
+        bool valid;
+        int64_t bos;
+        int seqLen;
+        int tileBase;
+        int nTiles;
+        int headIdx;
+        int seqIdx;
+    };
+
+    CATLASS_DEVICE
+    SeqSpan Locate(Params const& params, bool isAiv)
     {
-        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        const uint32_t subIdx = AscendC::GetSubBlockIdx();
+        SeqSpan sp{};
+        const uint32_t coreIdx = isAiv
+            ? AscendC::GetBlockIdx() / AscendC::GetSubBlockNum()
+            : AscendC::GetBlockIdx();
         if (static_cast<int>(coreIdx) >= params.N * params.H) {
+            return sp;
+        }
+        sp.headIdx = static_cast<int>(coreIdx) % params.H;
+        sp.seqIdx = static_cast<int>(coreIdx) / params.H;
+        ResolveSeq(params, sp.seqIdx, sp.bos, sp.seqLen, sp.tileBase);
+        sp.nTiles = (sp.seqLen + CHUNK - 1) / CHUNK;
+        sp.valid = true;
+        return sp;
+    }
+
+    CATLASS_DEVICE
+    void RunInitState(Params const& params)
+    {
+        if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        const int headIdx = static_cast<int>(coreIdx) % params.H;
-        const int seqIdx = static_cast<int>(coreIdx) / params.H;
-
-        int64_t bos = 0;
-        int seqLen = 0;
-        int tileBase = 0;
-        ResolveSeq(params, seqIdx, bos, seqLen, tileBase);
-        const int nTiles = (seqLen + CHUNK - 1) / CHUNK;
-        const bool active = (subIdx == 0);
-
-        if (active) {
-            InitState(params, seqIdx, headIdx);
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
         }
-
-        // Every chunk performs exactly two handshakes in both directions,
-        // whether or not this AIV is the active sub-core, so the AIC never
-        // waits on a flag that will not arrive.
-        for (int t = 0; t < nTiles; ++t) {
-            const int tileIdx = tileBase + t;
-            int len = seqLen - t * CHUNK;
-            if (len > CHUNK) {
-                len = CHUNK;
-            }
-
-            // Round 1: build u from v and the delta-rule correction.
-            if (active) {
-                BuildU(params, headIdx, tileIdx, bos + t * CHUNK, len);
-            }
-            AscendC::PipeBarrier<PIPE_ALL>();
-            if (subIdx == 0) {
-                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-                Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
-            }
-
-            // Round 2: combine out, then decay and update the state.
-            if (active) {
-                FinishOut(params, headIdx, tileIdx, bos + t * CHUNK, len);
-            }
-            AscendC::PipeBarrier<PIPE_ALL>();
-            if (subIdx == 0) {
-                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(elemReady_);
-                Catlass::Arch::CrossCoreWaitFlag(mmaReady_);
-            }
-
-            // Round 2's GEMMs are done: out can be summed and stored, and the
-            // state advanced with k_res^T @ u.
-            if (active) {
-                StoreOut(params, headIdx, tileIdx, bos + t * CHUNK, len);
-                DecayState(params, seqIdx, headIdx, tileIdx);
-            }
-        }
-
-        if (active && params.has_state_out != 0) {
-            StoreFinalState(params, seqIdx, headIdx);
+        SeqSpan sp = Locate(params, true);
+        if (sp.valid) {
+            InitState(params, sp.seqIdx, sp.headIdx);
         }
     }
 
-    template <>
-    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    CATLASS_DEVICE
+    void RunBuildU(Params const& params, int chunk)
     {
-        const uint32_t coreIdx = AscendC::GetBlockIdx();
-        if (static_cast<int>(coreIdx) >= params.N * params.H) {
+        if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        const int headIdx = static_cast<int>(coreIdx) % params.H;
-        const int seqIdx = static_cast<int>(coreIdx) / params.H;
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
+        SeqSpan sp = Locate(params, true);
+        if (!sp.valid || chunk >= sp.nTiles) {
+            return;
+        }
+        int len = sp.seqLen - chunk * CHUNK;
+        if (len > CHUNK) {
+            len = CHUNK;
+        }
+        BuildU(params, sp.headIdx, sp.tileBase + chunk, sp.bos + chunk * CHUNK, len);
+    }
 
-        int64_t bos = 0;
-        int seqLen = 0;
-        int tileBase = 0;
-        ResolveSeq(params, seqIdx, bos, seqLen, tileBase);
-        const int nTiles = (seqLen + CHUNK - 1) / CHUNK;
+    CATLASS_DEVICE
+    void RunPreGemms(Params const& params, int chunk)
+    {
+        if constexpr (g_coreType != AscendC::AIC) {
+            return;
+        }
+        SeqSpan sp = Locate(params, false);
+        if (!sp.valid || chunk >= sp.nTiles) {
+            return;
+        }
+        PreGemms(params, sp.seqIdx, sp.headIdx, sp.tileBase + chunk);
+    }
 
-        for (int t = 0; t < nTiles; ++t) {
-            const int tileIdx = tileBase + t;
+    CATLASS_DEVICE
+    void RunFinishOut(Params const& params, int chunk)
+    {
+        if constexpr (g_coreType != AscendC::AIV) {
+            return;
+        }
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
+        SeqSpan sp = Locate(params, true);
+        if (!sp.valid || chunk >= sp.nTiles) {
+            return;
+        }
+        int len = sp.seqLen - chunk * CHUNK;
+        if (len > CHUNK) {
+            len = CHUNK;
+        }
+        FinishOut(params, sp.headIdx, sp.tileBase + chunk, sp.bos + chunk * CHUNK, len);
+    }
 
-            // Round 1: the two GEMMs u depends on.
-            Catlass::Arch::CrossCoreWaitFlag(elemReady_);
-            PreGemms(params, seqIdx, headIdx, tileIdx);
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
+    CATLASS_DEVICE
+    void RunPostGemms(Params const& params, int chunk)
+    {
+        if constexpr (g_coreType != AscendC::AIC) {
+            return;
+        }
+        SeqSpan sp = Locate(params, false);
+        if (!sp.valid || chunk >= sp.nTiles) {
+            return;
+        }
+        PostGemms(params, sp.seqIdx, sp.headIdx, sp.tileBase + chunk);
+    }
 
-            // Round 2: out contribution, then the state's rank-16 update.
-            Catlass::Arch::CrossCoreWaitFlag(elemReady_);
-            PostGemms(params, seqIdx, headIdx, tileIdx);
-            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(mmaReady_);
+    CATLASS_DEVICE
+    void RunFinishChunk(Params const& params, int chunk)
+    {
+        if constexpr (g_coreType != AscendC::AIV) {
+            return;
+        }
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
+        SeqSpan sp = Locate(params, true);
+        if (!sp.valid || chunk >= sp.nTiles) {
+            return;
+        }
+        int len = sp.seqLen - chunk * CHUNK;
+        if (len > CHUNK) {
+            len = CHUNK;
+        }
+        const int tileIdx = sp.tileBase + chunk;
+        StoreOut(params, sp.headIdx, tileIdx, sp.bos + chunk * CHUNK, len);
+        DecayState(params, sp.seqIdx, sp.headIdx, tileIdx);
+    }
+
+    CATLASS_DEVICE
+    void RunStoreFinalState(Params const& params)
+    {
+        if constexpr (g_coreType != AscendC::AIV) {
+            return;
+        }
+        if (AscendC::GetSubBlockIdx() != 0) {
+            return;
+        }
+        if (params.has_state_out == 0) {
+            return;
+        }
+        SeqSpan sp = Locate(params, true);
+        if (sp.valid) {
+            StoreFinalState(params, sp.seqIdx, sp.headIdx);
         }
     }
 
@@ -684,8 +740,6 @@ private:
     }
 
     Catlass::Arch::Resource<ArchTag> resource_;
-    Catlass::Arch::CrossCoreFlag elemReady_{K2_ELEM_READY};
-    Catlass::Arch::CrossCoreFlag mmaReady_{K2_MMA_READY};
 };
 
 }  // namespace flash_kda
