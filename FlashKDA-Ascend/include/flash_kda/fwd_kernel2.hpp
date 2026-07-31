@@ -805,6 +805,14 @@ private:
         mp.cmatrixInitVal = true;
         AscendC::Mmad(l0C, l0A, l0B, mp);
 
+        // The MMAD reads L0A/L0B; the next GEMM's LoadData overwrites them.
+        // Without M_MTE1 between the two, MTE1 can start writing L0B while the
+        // cube is still reading it -- reported as "L0B read/write conflict in
+        // the MTE (same address)". These helpers are called back to back with
+        // the same L0 buffers, so the barrier belongs right after the Mmad.
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)5);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)5);
+
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)0);
 
@@ -878,6 +886,14 @@ private:
         mp.k = CHUNK;
         mp.cmatrixInitVal = true;
         AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        // The MMAD reads L0A/L0B; the next GEMM's LoadData overwrites them.
+        // Without M_MTE1 between the two, MTE1 can start writing L0B while the
+        // cube is still reading it -- reported as "L0B read/write conflict in
+        // the MTE (same address)". These helpers are called back to back with
+        // the same L0 buffers, so the barrier belongs right after the Mmad.
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)5);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)5);
 
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
