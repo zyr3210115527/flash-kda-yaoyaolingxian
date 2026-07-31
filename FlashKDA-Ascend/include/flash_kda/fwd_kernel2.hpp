@@ -659,8 +659,8 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
 
-        LoadNd2Nz(bufs, l1A, gm, aByte, m, k);
-        LoadNd2Nz(bufs, l1B, gm, bByte, k, n);
+        LoadNd2Nz(bufs, l1A, gm, aByte, m, k);   // A: RowMajor -> zN, feeds L0A
+        LoadBGmToL1zZ(l1B, gm, bByte, k, n);     // B: RowMajor -> zZ, feeds L0B
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
@@ -672,8 +672,7 @@ private:
         ld.ifTranspose = false;
         ld.repeatTimes = (m / 16) * (k / 16);
         AscendC::LoadData(l0A, l1A, ld);
-        ld.repeatTimes = (k / 16) * (n / 16);
-        AscendC::LoadData(l0B, l1B, ld);
+        LoadBL1ToL0B(l0B, l1B, k, n);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)0);
@@ -726,7 +725,7 @@ private:
         p.dstNzNStride = 1;
         p.dstNzMatrixStride = 0;
         AscendC::DataCopy(l1A, gm[aByte / 2], p);
-        LoadNd2Nz(bufs, l1B, gm, bByte, CHUNK, D);
+        LoadBGmToL1zZ(l1B, gm, bByte, CHUNK, D);   // B: RowMajor -> zZ
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)1);
@@ -739,13 +738,7 @@ private:
         la.repeatTimes = (D / 16) * (CHUNK / 16);
         AscendC::LoadData(l0A, l1A, la);
 
-        AscendC::LoadData2DParams lb;
-        lb.startIndex = 0;
-        lb.srcStride = 1;
-        lb.dstGap = 0;
-        lb.ifTranspose = false;
-        lb.repeatTimes = (CHUNK / 16) * (D / 16);
-        AscendC::LoadData(l0B, l1B, lb);
+        LoadBL1ToL0B(l0B, l1B, CHUNK, D);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
@@ -761,6 +754,51 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
 
         Drain(bufs, params, l0C, cByte, D, D, false);
+    }
+
+    // ---- B operand path: GM RowMajor -> L1 zZ -> L0B nZ (transposing) ----
+    //
+    // L0B accepts only zZ (transposing) or nZ (not). A RowMajor B has to go
+    // through zZ; loading it as zN and issuing ifTranspose = false is not a
+    // supported combination and silently produces the wrong operand.
+
+    CATLASS_DEVICE
+    void LoadBGmToL1zZ(AscendC::LocalTensor<BF16> dst, AscendC::GlobalTensor<BF16> src,
+                       int64_t byteOff, int k, int n)
+    {
+        const int colsRound = (n + C0_NUM_PER_FRACTAL - 1) / C0_NUM_PER_FRACTAL
+                              * C0_NUM_PER_FRACTAL;
+        AscendC::Nd2NzParams p;
+        p.ndNum = static_cast<uint16_t>(k / C0_NUM_PER_FRACTAL);
+        p.nValue = static_cast<uint16_t>(C0_NUM_PER_FRACTAL);
+        p.dValue = static_cast<uint16_t>(n);
+        p.srcNdMatrixStride = static_cast<uint16_t>(C0_NUM_PER_FRACTAL * n);
+        p.srcDValue = static_cast<uint16_t>(n);
+        p.dstNzC0Stride = static_cast<uint16_t>(C0_NUM_PER_FRACTAL);
+        p.dstNzNStride = 1;
+        p.dstNzMatrixStride = static_cast<uint16_t>(colsRound * C0_NUM_PER_FRACTAL);
+        AscendC::DataCopy(dst, src[byteOff / 2], p);
+    }
+
+    CATLASS_DEVICE
+    void LoadBL1ToL0B(AscendC::LocalTensor<BF16> l0B, AscendC::LocalTensor<BF16> l1B,
+                      int k, int n)
+    {
+        const int colsRound = (n + C0_NUM_PER_FRACTAL - 1) / C0_NUM_PER_FRACTAL
+                              * C0_NUM_PER_FRACTAL;
+        const int fractalRows = (k + C0_NUM_PER_FRACTAL - 1) / C0_NUM_PER_FRACTAL;
+        const int stride1 = colsRound * C0_NUM_PER_FRACTAL;
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = static_cast<uint16_t>((n + C0_NUM_PER_FRACTAL - 1)
+                                               / C0_NUM_PER_FRACTAL);
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = true;
+        for (int i = 0; i < fractalRows; ++i) {
+            AscendC::LoadData(l0B[i * stride1], l1B[i * stride1], ld);
+        }
     }
 
     CATLASS_DEVICE

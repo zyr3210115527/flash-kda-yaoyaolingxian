@@ -2,8 +2,8 @@
 
 ## Where things stand
 
-**Kernel1 works on hardware.** All four phases run clean, and its outputs are
-verified numerically on a 910B3 against float64 CPU expectations:
+**Kernel1 works and is verified on hardware.** All four phases run clean, and
+every output is checked against float64 CPU expectations on a 910B3:
 
 ```
 k_decayed  1.478e-03    q_decayed  1.674e-03
@@ -12,17 +12,67 @@ g_total    8.962e-07    Mqk        3.851e-03
 INV        1.047e-02
 ```
 
-It also holds up at T=64, H=4 (16 cores), not just the single tile it was
-debugged on.
+It also holds at T=64, H=4 (16 cores), not just the single tile it was debugged
+on.
 
-**Kernel2 is split but its cube phases fault.** It no longer uses cross-core
-handshakes; the chunk loop is on the host and each chunk issues five
-stream-ordered launches. Running it raises an aicore exception, so the forward
-pass still does not complete end to end.
+**The full forward pass runs end to end** — B=1 T=64 H=4 D=128 completes with
+finite, non-zero output, no hang and no aicore exception. Both kernels execute.
 
-The CPU oracle is verified: `tests/validate_ref.py` passes 5/5 against an
-independently written float64 delta-rule loop, and fixed a real NaN bug in
-torch_ref on the way.
+**But kernel2 is numerically wrong**: `err_ratio = 9.999e-01` against torch_ref,
+i.e. the output is essentially uncorrelated with the reference rather than
+imprecise. Kernel1's outputs are all individually verified, so the fault is in
+kernel2's recurrence.
+
+## The next thing to fix, with the derivation done
+
+kernel2's `Gemm` and `GemmAt` load their B operand from GM as RowMajor→**zN**
+and then issue `LoadData` with `ifTranspose = false`. L0B accepts only two
+source layouts:
+
+    zZ -> nZ   with ifTranspose = true
+    nZ -> nZ   with ifTranspose = false
+
+zN with `ifTranspose = false` is neither, which is exactly the shape of bug that
+produces a well-formed-but-wrong operand: no fault, uncorrelated output.
+
+Kernel1 does not hit this because `LoadBt` puts its B into L1 as nZ directly via
+the ColumnMajor parameterization. Kernel2's B operands (v, u, the state) are
+genuinely RowMajor `[k, n]`, and viewing them as ColumnMajor would give Bᵀ, not
+B — so they have to go through zZ.
+
+Derived from `CopyGmToL1<RowMajor, zZ, B1>` and `zZ::MakeLayout`:
+
+    GM RowMajor [k, n] -> L1 zZ
+      ndNum             = k / 16
+      nValue            = 16
+      dValue            = n
+      srcNdMatrixStride = 16 * n
+      srcDValue         = n
+      dstNzC0Stride     = zZ.stride(3) / C0 = 256 / 16 = 16
+      dstNzNStride      = zZ.stride(0) / C0 = 16 / 16  = 1
+      dstNzMatrixStride = zZ.stride(1)      = roundUp16(n) * 16
+
+    L1 zZ -> L0B nZ   (CopyL1ToL0B<zZ, nZ>)
+      repeatTimes = ceil(n / 16)
+      srcStride   = 1
+      dstGap      = 0
+      ifTranspose = true
+      looped over ceil(k / 16) fractal rows, stride roundUp16(n) * 16 both sides
+
+**I implemented exactly this and it hung**, so something in it is still off —
+most likely one of the uint16 stride fields or the L1 slot sizing (`Gemm` puts B
+at `K2L1::kState`, a 32 KB slot; `GemmAt` puts it at `K2L1::kB`, only 4 KB,
+which exactly fits a `[16,128]` tile with no slack). That attempt is reverted;
+the tree is back to the state that runs end to end with wrong numbers.
+`scratchpad/patch_k2_bpath.py` holds the attempt if it is worth resuming rather
+than redoing.
+
+The durable alternative — and probably the faster one now — is to stop
+hand-writing these descriptors and call the catlass tile classes directly
+(`CopyGmToL1`, `CopyL1ToL0A`, `CopyL1ToL0B`, `CopyL0CToGm`), which take layout
+objects and derive every field themselves. Every layout bug in this project so
+far has been a hand-derived stride.
+
 
 ## What was actually wrong (all confirmed on hardware)
 
