@@ -28,7 +28,25 @@ and the non-determinism are unresolved.
 
 ## What to chase next, in order
 
-1. **The race.** Three things were fixed and none of them was it:
+1. **The race — now localized to the chunk-to-chunk state carry.** Capping the
+   chunk loop at one makes kernel2 **bit-deterministic**: four runs give
+   err_ratio=8.8452e-01 exactly, no faults. Uncapped, the same binary gives
+   4.3917e-01 / 4.3926e-01 / 4.3930e-01 and fails outright about one run in
+   three. So nothing inside a chunk races; the fault is in what one chunk hands
+   the next, which is only the recurrent state in GM at `StateOff()`.
+
+   `DecayState` (AIV) writes it at the end of chunk t; `StateToBf16` (AIV) reads
+   it at the start of chunk t+1. The writer-side flush already added is not
+   enough — `DataCacheCleanAndInvalid` pushes the line out of the *writer's*
+   cache, but the reader is a separate launch and may still hold a stale copy of
+   that address. **Invalidate on the read side before loading the state** is the
+   next thing to try.
+
+   (The single-chunk 0.8845 is not comparable to the uncapped 0.4393 — capping
+   leaves later chunks unprocessed, so most of the output is missing. It is a
+   determinism probe only.)
+
+   Three things were fixed along the way and none of them was the race:
    - `DataCacheCleanAndInvalid` on the six workspace stores that cross a phase
      boundary. This *did* remove the intermittent aicore exceptions.
    - The workspace was `torch.empty`; it is now zeroed.
