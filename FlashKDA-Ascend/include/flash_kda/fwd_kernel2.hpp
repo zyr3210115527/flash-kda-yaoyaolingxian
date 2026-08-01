@@ -373,9 +373,20 @@ public:
         const int maxChunks = params.total_tiles;
 
         if constexpr (g_coreType == AscendC::AIV) {
-            if (AscendC::GetSubBlockIdx() != 0) {
-                return;
-            }
+            // Both AIV subblocks run. Mode 0x2 pairs the two vector cores with
+            // the one cube core inside an AI Core, so both must reach every
+            // flag; the work split goes around the work, never around a flag.
+            //
+            // DecayState is 5.0 ms of kernel2's 6.65 ms of vector time, so it
+            // and the bf16 cast are split by row range. The [CHUNK, D] phases
+            // stay on subblock 0 for now -- they are 2.6 ms between them and
+            // splitting them is a separate change.
+            const uint32_t nsub = AscendC::GetSubBlockNum();
+            const uint32_t sub = AscendC::GetSubBlockIdx();
+            const int rowsPer = D / static_cast<int>(nsub);
+            const int r0 = static_cast<int>(sub) * rowsPer;
+            const bool lead = (sub == 0);
+
             K2AivBufs bufs;
 
             // The state lives here for the whole loop. InitState builds it in
@@ -385,6 +396,8 @@ public:
             auto stateResident = bufs.template Ub<float>(K2Ub::kStateA);
 
             if (sp.valid) {
+                // Both subblocks build the whole state; each then maintains
+                // only its own rows.
                 InitState(bufs, params, sp.seqIdx, sp.headIdx);
                 int len0 = sp.seqLen;
                 if (len0 > CHUNK) {
@@ -415,7 +428,7 @@ public:
 
                 // AIC is running PreGemms(c).
                 Catlass::Arch::CrossCoreWaitFlag(aicReady);
-                if (live) {
+                if (live && lead) {
                     FinishOut(bufs, params, sp.headIdx, tileIdx,
                               sp.bos + c * CHUNK, len);
                 }
@@ -424,10 +437,12 @@ public:
                 // AIC is running PostGemms(c).
                 Catlass::Arch::CrossCoreWaitFlag(aicReady);
                 if (live) {
-                    StoreOut(bufs, params, sp.headIdx, tileIdx,
-                             sp.bos + c * CHUNK, len);
-                    DecayStateResident(bufs, params, sp.headIdx, tileIdx,
-                                       stateResident);
+                    if (lead) {
+                        StoreOut(bufs, params, sp.headIdx, tileIdx,
+                                 sp.bos + c * CHUNK, len);
+                    }
+                    DecayStateResidentRows(bufs, params, sp.headIdx, tileIdx,
+                                           stateResident, r0, rowsPer);
                     if (c + 1 < sp.nTiles) {
                         // Same pairing the merged launch used: BuildU for the
                         // next chunk runs here, after DecayState has produced
@@ -437,24 +452,34 @@ public:
                         if (nlen > CHUNK) {
                             nlen = CHUNK;
                         }
-                        BuildU(bufs, params, sp.headIdx, tileIdx + 1,
-                               sp.bos + (c + 1) * CHUNK, nlen,
-                               /*castState=*/false);
-                        StateToBf16Resident(bufs, params, tileIdx + 1,
-                                            sp.headIdx, stateResident);
+                        if (lead) {
+                            BuildU(bufs, params, sp.headIdx, tileIdx + 1,
+                                   sp.bos + (c + 1) * CHUNK, nlen,
+                                   /*castState=*/false);
+                        }
+                        StateToBf16ResidentRows(bufs, params, tileIdx + 1,
+                                                sp.headIdx, stateResident,
+                                                r0, rowsPer);
                     }
                 }
                 Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
             }
 
             if (sp.valid && params.has_state_out != 0) {
+                // The final state transposes across the whole tile, so each
+                // subblock publishes its rows to GM first and the lead reads a
+                // complete copy back. Once per sequence, not per chunk.
+                PublishStateRows(params, sp.seqIdx, sp.headIdx, stateResident,
+                                 r0, rowsPer);
                 // StoreFinalState reads the state back from GM, and the last
                 // chunk's DecayState wrote it from this same core moments ago.
                 // As a separate launch that ordering was free; inside one
                 // kernel the store must retire before the load is issued.
                 AscendC::PipeBarrier<PIPE_ALL>();
-                StoreFinalStateResident(bufs, params, sp.seqIdx, sp.headIdx,
-                                        stateResident);
+                Catlass::Arch::CrossCoreBarrier<0x1, PIPE_MTE3>();
+                if (lead) {
+                    StoreFinalState(bufs, params, sp.seqIdx, sp.headIdx);
+                }
             }
         } else {
             K2AicBufs bufs;
@@ -911,6 +936,80 @@ private:
         }
         AscendC::Add(sf, sf, upd, D * D);
         AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // DecayState over a row range only, so the two AIV subblocks can split it.
+    //
+    // Each subblock keeps the full [D, D] state in its own UB -- they both run
+    // InitState -- but maintains only rows [r0, r0+rows). Indexing by the
+    // global row therefore works unchanged, and nothing reads the half a
+    // subblock does not own.
+    CATLASS_DEVICE
+    void DecayStateResidentRows(K2AivBufs& bufs, Params const& params, int headIdx,
+                                int tileIdx, AscendC::LocalTensor<float> sf,
+                                int r0, int rows)
+    {
+        auto upd = bufs.template Ub<float>(K2Ub::kStateB);
+        auto gt = bufs.template Ub<float>(K2Ub::kGTotal);
+
+        AscendC::GlobalTensor<float> wsF;
+        wsF.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+
+        AscendC::DataCopy(upd[r0 * D],
+                          wsF[Slot(params, tileIdx, headIdx, 7) / 4 + r0 * D],
+                          rows * D);
+        AscendC::DataCopy(gt, wsF[Ws(params, tileIdx, headIdx,
+                                     WorkspaceOffsets::kGTotal) / 4], D);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>((event_t)3);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>((event_t)3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>((event_t)3);
+
+        for (int r = r0; r < r0 + rows; ++r) {
+            AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)0);
+            const float g = gt.GetValue(r);
+            AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)0);
+            AscendC::Muls(sf[r * D], sf[r * D], g, D);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        AscendC::Add(sf[r0 * D], sf[r0 * D], upd[r0 * D], rows * D);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // The bf16 cast of a row range, likewise split across subblocks.
+    CATLASS_DEVICE
+    void StateToBf16ResidentRows(K2AivBufs& bufs, Params const& params, int tileIdx,
+                                 int headIdx, AscendC::LocalTensor<float> sf,
+                                 int r0, int rows)
+    {
+        auto sb = bufs.template Ub<BF16>(K2Ub::kStateB);
+        AscendC::GlobalTensor<BF16> wsB;
+        wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+
+        AscendC::Cast(sb[r0 * D], sf[r0 * D], AscendC::RoundMode::CAST_RINT, rows * D);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)1);
+        AscendC::DataCopy(wsB[Slot(params, tileIdx, headIdx, 3) / 2 + r0 * D],
+                          sb[r0 * D], rows * D);
+        FlushGm<BF16>(wsB, Slot(params, tileIdx, headIdx, 3) / 2 + r0 * D, rows * D);
+    }
+
+    // Publish a row range of the resident state back to the state slot in GM,
+    // so the final-state path (which transposes across the whole tile) can read
+    // a complete copy.
+    CATLASS_DEVICE
+    void PublishStateRows(Params const& params, int seqIdx, int headIdx,
+                          AscendC::LocalTensor<float> sf, int r0, int rows)
+    {
+        AscendC::GlobalTensor<float> gmS;
+        gmS.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.workspace));
+        const int64_t off = StateOff(params, seqIdx, headIdx) / 4 + r0 * D;
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>((event_t)4);
+        AscendC::DataCopy(gmS[off], sf[r0 * D], rows * D);
+        FlushGm<float>(gmS, off, rows * D);
     }
 
     // Cast a UB-resident state to bf16 for the cube, without reading GM.
