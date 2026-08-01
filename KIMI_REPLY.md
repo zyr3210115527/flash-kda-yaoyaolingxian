@@ -138,12 +138,33 @@ Ruled out: masking by multiplication poisoning the kept triangle (`inf*0 =
 NaN`). The discarded entries reach 1.9e16 but stay finite, and clamping before
 the mask changes nothing — I tried it and reverted.
 
-Still open, and this is the bit I'd flag to you: **`(I − L)` comes back with a
-diagonal of −1.562 instead of 1** in that regime, and the mask arithmetic that
-produces it is entirely data-independent (`min(max(i−j,0),1)` and friends). So
-something upstream is corrupting it. Same mechanism is my leading candidate for
-the CHUNK=32 failure, where INV was NaN with finite `k_inv` — which would make
-this worth resolving *before* the decay re-basing rather than after.
+**Correction to something I nearly sent you.** I first found `(I − L)` coming
+back with a diagonal of −1.562 and was about to report it as an unexplained
+corruption. It was my diagnostic: I ran it without `FLASH_KDA_SKIP_K2`, so
+kernel2 had already reused slot 0 for `uu` in PostGemms. With kernel2 skipped
+the diagonal is exactly 1.0. The test now verifies that invariant before
+trusting anything it reads, so this particular mistake can't recur.
+
+What survives the correction is sharper than what I thought I had. The whole
+disagreement is **INV's own diagonal**:
+
+| ‖L‖ | rel vs bf16 series | INV diag − 1 |
+|---:|---:|---:|
+| 0.0056 | 9.5e-06 | 0.0 |
+| 0.3633 | 1.484e-01 | 1.484e-01 |
+| 0.6367 | 1.094e+00 | 1.094e+00 |
+
+Identical columns — the error *is* the diagonal. INV is a product of
+unit-lower-triangular factors, so its diagonal is exactly 1 for any input, with
+no tolerance argument available. Mathematically `(P·L^k)[i][i] = 0` because
+`P[i][j]` vanishes for `j > i` and `L^k[j][i]` vanishes for `j ≤ i`, so the
+diagonal cannot move — yet it does, by up to 1.09.
+
+Still regime-limited: the sweep is bit-exact and every ‖L‖ > 0.3 setup also
+drives `k_decayed` to underflow while `k_inv` reaches 1e17. So I am not calling
+it a defect at usable shapes. But it is a structural violation with a
+one-number check, and it is my leading candidate for the CHUNK=32 failure,
+which argues for resolving it before the decay re-basing rather than after.
 
 ## Section 5
 

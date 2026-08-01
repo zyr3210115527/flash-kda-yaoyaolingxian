@@ -74,18 +74,34 @@ def run(correlation, beta_scale, a_log_val):
 
     L = tile(_C.WS_SLOT_OFF[5])            # plain L, what Neumann squares
     INV = tile(_C.WS_OFF_KINV)
-    return L, INV
+    ImL = tile(_C.WS_SLOT_OFF[0])          # (I - L), diagonal is structurally 1
+
+    # Validate the addressing before trusting anything read through it.
+    #
+    # (I - L) has a unit diagonal by construction, whatever the inputs, so it
+    # is a free check that these offsets point where they are believed to. An
+    # earlier version of this test skipped it, read slot 0 as bf16 when it in
+    # fact still held the cube's fp32 L, and produced a "kernel anomaly" that
+    # was entirely the reader's -- the giveaway was that the values scaled
+    # exactly 2x with the inputs, which a structural identity cannot do.
+    diag_ok = bool((ImL.diagonal() - 1.0).abs().max() < 0.05)
+    # INV is a product of unit-lower-triangular factors, so its diagonal is
+    # structurally 1 whatever the inputs. Cheap, and independent of tolerance.
+    inv_diag_err = float((INV.diagonal() - 1.0).abs().max())
+    return L, INV, diag_ok, inv_diag_err
 
 
 def main():
     print(f"{'corr':>6} {'beta':>6} {'a_log':>6} {'||L||':>8} "
-          f"{'|exact|':>9} {'rel vs bf16':>12} {'rel vs exact':>13} "
-          f"{'I-L abs err':>12}  verdict")
+          f"{'rel vs bf16':>12} {'INV diag-1':>11} {'I-L abs err':>12}  verdict")
     worst_ok = True
     any_discriminating = [False]
+    addressing_ok = [True]
     for corr, bs, al in ((0.0, 0.0, 0.0), (0.9, 3.0, 6.0),
                          (0.98, 6.0, 10.0), (0.995, 8.0, 12.0)):
-        L, INV = run(corr, bs, al)
+        L, INV, diag_ok, inv_diag_err = run(corr, bs, al)
+        if not diag_ok:
+            addressing_ok[0] = False
         eye = torch.eye(CHUNK, dtype=torch.float64)
         exact = torch.linalg.inv(eye + L)          # L strictly lower => exact
 
@@ -124,45 +140,43 @@ def main():
         verdict = ("OK" if discriminating else "weak") if ok else "FAIL"
         worst_ok &= ok
         any_discriminating[0] |= discriminating
-        print(f"{corr:>6.3f} {bs:>6.1f} {al:>6.1f} {lmax:>8.4f} {scale:>9.1f} "
-              f"{err:>12.3e} {exact_gap:>13.3e} {naive:>12.3e}  {verdict}")
+        print(f"{corr:>6.3f} {bs:>6.1f} {al:>6.1f} {lmax:>8.4f} "
+              f"{err:>12.3e} {inv_diag_err:>11.3e} {naive:>12.3e}  {verdict}")
 
     print()
-    print("'rel vs bf16' is the verdict column: the kernel against the same")
-    print("Neumann series emulated at the same precision, relative to the size of")
-    print("the inverse. The absolute columns are shown because the inverse grows")
-    print("to ~1e3 at the high end, which is what makes absolute thresholds lie.")
+    print("'rel vs bf16' compares the kernel against the same Neumann series")
+    print("emulated at the same precision, so it isolates implementation from")
+    print("bf16. 'INV diag-1' is structural: INV is a product of unit-lower-")
+    print("triangular factors, so its diagonal must be exactly 1 for any input,")
+    print("with no tolerance argument available.")
 
     print()
+    if not addressing_ok[0]:
+        print("INCONCLUSIVE: the workspace offsets do not point where this test")
+        print("believes -- (I - L) came back without a unit diagonal, which is")
+        print("structural and cannot depend on the inputs. Every number above is")
+        print("read through those offsets, so none of them mean anything until")
+        print("the addressing is fixed. Not a kernel result.")
+        return 1
+
     if not any_discriminating[0]:
         print("INCONCLUSIVE: no case drove ||L|| high enough for the series to")
         print("matter, so this run does not distinguish it from I - L.")
         return 1
 
     if not worst_ok:
-        print("UNRESOLVED -- and deliberately not a gating failure. See below.")
+        print("FAIL: the kernel disagrees with its own series at high ||L||.")
+        print("The addressing self-check passes -- (I - L) has its unit diagonal")
+        print("-- so this is not a misread, and INV's own diagonal departs from 1,")
+        print("which no tolerance argument covers.")
         print()
-        print("The high-||L|| rows disagree with the series by ~100% of the")
-        print("inverse's magnitude. That is real and unexplained, but every")
-        print("regime that produces ||L|| > 0.3 also drives the kernel's own")
-        print("inputs degenerate: at a_log >= 6, k_decayed underflows to exactly")
-        print("zero from row ~12 on while k_inv reaches 1e17, because")
-        print("k_dec = k*exp(gc) and k_inv = k*exp(-gc) pull apart as the")
-        print("in-chunk decay grows. So the series is being fed values at the")
-        print("edge of fp32, and this does not demonstrate a fault at inputs")
-        print("anyone would use -- the 12-shape sweep is clean and bit-exact.")
-        print()
-        print("Checked and ruled out: masking by multiplication poisoning the")
-        print("kept triangle (inf*0 = NaN). The discarded entries reach 1.9e16")
-        print("but stay finite, and clamping before the mask changes nothing.")
-        print("Still open: (I - L) comes back with a diagonal of -1.562 instead")
-        print("of 1 in this regime, and that mask arithmetic is data-independent,")
-        print("so something upstream is corrupting it.")
-        print()
-        print("Worth resolving before CHUNK is raised: the same mechanism is a")
-        print("candidate for the CHUNK=32 failure, where INV was NaN even with")
-        print("finite k_inv.")
-        return 0
+        print("Not reproduced at usable inputs: the 12-shape sweep is bit-exact,")
+        print("and every regime reaching ||L|| > 0.3 also drives k_decayed to")
+        print("underflow while k_inv reaches 1e17. Treat it as a lead on the")
+        print("CHUNK=32 failure (INV was NaN there with finite k_inv) rather")
+        print("than as a defect at shapes anyone runs today.")
+        return 1
+
     print("PASS")
     return 0
 
