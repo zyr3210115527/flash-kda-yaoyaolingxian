@@ -39,6 +39,7 @@
 #include "flash_kda/utils.hpp"
 
 #include "catlass/arch/arch.hpp"
+#include "catlass/arch/cross_core_sync.hpp"
 #include "kernel_operator.h"
 
 namespace flash_kda {
@@ -186,6 +187,80 @@ public:
     // kernels means stating it directly.
     // Phase entry points. Each runs on one core type only; the four are
     // launched separately and ordered by the stream. See PHASES note above.
+    // All four phases in one kernel, handing off by cross-core flag.
+    //
+    // The four launches are only 4 per call rather than 4 per chunk, so the
+    // dispatch saving is small -- but each unit now stays on one core across
+    // all four phases instead of being re-scheduled four times, and the
+    // grid-stride loop's per-unit PIPE_ALL barrier is paid once per unit here
+    // rather than once per unit per phase.
+    //
+    // Needs KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1) on the entry, as
+    // kernel2's fused path does.
+    CATLASS_DEVICE void RunFusedPrepare(Params const& params)
+    {
+        AscendC::SetSyncBaseAddr(params.sync_base_addr);
+
+        Catlass::Arch::CrossCoreFlag aivReady{1};
+        Catlass::Arch::CrossCoreFlag aicReady{2};
+
+        const int units = params.total_tiles * params.H;
+
+        if constexpr (g_coreType == AscendC::AIV) {
+            if (AscendC::GetSubBlockIdx() != 0) {
+                return;
+            }
+            K1AivBufs bufs;
+            const uint32_t stride = AscendC::GetBlockNum();
+            const uint32_t start = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+
+            // Prepare for every unit this block owns, then hand to the cube.
+            for (uint32_t i = start; static_cast<int>(i) < units; i += stride) {
+                TileSpan span;
+                ResolveTile(params, static_cast<int>(i) / params.H, span);
+                if (span.valid) {
+                    Prepare(bufs, params, static_cast<int>(i) % params.H, span);
+                }
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
+
+            Catlass::Arch::CrossCoreWaitFlag(aicReady);
+            for (uint32_t i = start; static_cast<int>(i) < units; i += stride) {
+                TileSpan span;
+                ResolveTile(params, static_cast<int>(i) / params.H, span);
+                if (span.valid) {
+                    MaskAndBuild(bufs, params, static_cast<int>(i) % params.H, span);
+                }
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
+        } else {
+            K1AicBufs bufs;
+            const uint32_t stride = AscendC::GetBlockNum();
+            const uint32_t start = AscendC::GetBlockIdx();
+
+            Catlass::Arch::CrossCoreWaitFlag(aivReady);
+            for (uint32_t i = start; static_cast<int>(i) < units; i += stride) {
+                TileSpan span;
+                ResolveTile(params, static_cast<int>(i) / params.H, span);
+                if (span.valid) {
+                    ComputeLAndMqk(bufs, params, static_cast<int>(i) % params.H, span);
+                }
+            }
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
+
+            Catlass::Arch::CrossCoreWaitFlag(aivReady);
+            for (uint32_t i = start; static_cast<int>(i) < units; i += stride) {
+                TileSpan span;
+                ResolveTile(params, static_cast<int>(i) / params.H, span);
+                if (span.valid) {
+                    ComputeNeumann(bufs, params, static_cast<int>(i) % params.H, span);
+                }
+            }
+        }
+    }
+
     CATLASS_DEVICE void RunPrepare(Params const& params)
     {
         if constexpr (g_coreType != AscendC::AIV) {

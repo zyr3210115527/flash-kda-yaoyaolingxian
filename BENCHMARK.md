@@ -35,8 +35,8 @@ zeros and copied it, and ~20 GB does not go through the host:
 
 | T | H | workspace | ours ms | CUDA/H20 ms | ratio |
 |---:|---:|---:|---:|---:|---:|
-| 8192 | 64 | 18.6 G | 80.03 | 1.6217 | **49×** |
-| 8192 | 96 | 27.9 G | 113.72 | 2.6220 | **43×** |
+| 8192 | 64 | 6.3 G | 61.03 | 1.6217 | **38×** |
+| 8192 | 96 | 9.5 G | 85.70 | 2.6220 | **33×** |
 
 Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
 about 0.180 from H=64 onward, so this is a stable figure rather than one that
@@ -100,35 +100,61 @@ work.
 
 Measured, in order, with the outcome rather than the prediction:
 
-1. **Batch the L2 normalization** — no measurable change. Kept (same
-   arithmetic, less code), but chosen by reasoning rather than measurement,
-   which is why it missed.
-
-2. **Grid-stride kernel1, first attempt** — no change, reverted. Correct at the
-   time: compute still dominated, so cutting dispatch changed nothing.
-
+1. **Batch the L2 normalization** — no change. Kept; chosen by reasoning, which
+   is why it missed.
+2. **Grid-stride kernel1, first attempt** — no change, reverted. Correct then:
+   compute still dominated.
 3. **Fuse the Neumann series** — kernel1 0.97 → 0.76 ms. 16 cube round trips,
-   10 of them `X * I` matrix copies done as 16×16×16 matmuls, became 6 via a
-   fused `dst = A*B1 + A*B2`.
+   10 of them `X * I` copies, became 6.
+4. **Fold BuildU into the previous FinishChunk** — 5 launches per chunk → 4.
+5. **Stop reallocating the workspace** — 29.96 → 2.73 ms end-to-end, ~11×.
+6. **Vectorize the mask** — exact, almost no time, but it exposed that dispatch
+   had become 85% of kernel1.
+7. **Grid-stride again + batch the row loops** — 86.54 → 80.03 ms.
+8. **Size the scratch slots to what they hold** — workspace 18.6 → 6.3 GB, and
+   80.03 → 76.58 ms.
+9. **Declare kernel task types** — ~1.7%. Every phase runs on one core type,
+   but without `KERNEL_TASK_TYPE_DEFAULT` each launch starts blocks on both.
+10. **Fuse kernel2 into one kernel** — the big one. 77.00 → 61.23 ms, 47× → 38×.
+11. **Fuse kernel1** — 0.3%, its four launches were per call, not per chunk.
 
-4. **Fold BuildU into the previous chunk's FinishChunk** — 3.18 → 2.81 ms at
-   T=1024 H=8. 5 launches per chunk became 4.
+Discarded after measuring (all interleaved, all no change):
 
-5. **Stop reallocating the workspace** — 29.96 → 2.73 ms end-to-end, ~11×. The
-   wrapper zeroed 302 MB on the host and copied it per call.
+- batching DecayState's 128-iteration scalar loop — the flushes were not the
+  cost;
+- casting the state from UB instead of re-reading 64 KB from GM — 2.0 GB of
+  reads removed, worth nothing, because the data was L2-resident;
+- narrowing the grid-stride barrier to `PIPE_MTE3` — also degraded race_probe
+  from 6/6 to 5/6.
 
-6. **Vectorize the mask** — ~850 scalar accesses per tile became ~40 vector
-   ops. Almost no time (I had over-estimated the loop by 14×), but exact, and
-   it exposed that dispatch was now 85% of kernel1.
+## The measurement that redirected everything
 
-7. **Grid-stride kernel1, second attempt** — now worth it, because 3 and 6 had
-   cut compute enough that dispatch dominated. Plus batching the `Decay` and
-   gate row loops (~350 barriers per tile → ~25). Together 86.54 → 80.03 ms.
+Launch overhead was estimated at 12–15% from a per-launch cost measured at
+blockDim=1. At blockDim=64 it is four times that. Measured directly, with every
+kernel2 phase stubbed so only launches remain, at T=4096 H=64:
 
-The re-profile that redirected everything: at T=1024 H=8 kernel2 is 79% launch
-overhead, but at T=8192 H=64 it is 15%, because blockDim there is 64 rather
-than 8. Optimizations chosen from the small-shape profile were aimed at the
-wrong half.
+| launches/chunk | ms |
+|---:|---:|
+| 4 | 36.6, 37.8 |
+| 2 | 26.0, 26.9 |
+| 1 | 21.0, 21.3 |
+| kernel1 alone | 15.9 |
+
+Perfectly linear, ~5.2 µs per launch — 21.6 ms, **54% of the pipeline**, while
+all of kernel2's phase compute is 2.5 ms. `benchmarks/launch_bound.py` then
+showed it is device-side: the host issues 1031 launches in 2.71 ms while the
+device spends 37.15 ms. So issuing launches more cheaply could not help; only
+issuing fewer.
+
+## Cross-core sync, and two wrong conclusions
+
+Every launch boundary in kernel2 existed to hand off between AIC and AIV, and
+twice I concluded `CrossCoreSetFlag`/`WaitFlag` hang from a Python extension and
+designed around it. Both were wrong. It needs
+`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1)` in the kernel body —
+without a declared task type the runtime never provisions FFTS sync, so the
+first wait blocks forever. Found only because `KERNEL_TASK_TYPE` turned up while
+looking for a way to stop mix launches starting blocks on both core types.
 
 ## On single-run verification
 
@@ -145,37 +171,17 @@ anything. A clean single run is not evidence.
 
 ## What to do next
 
-1. ~~Cheaper inter-unit sync in kernel1.~~ **Done, and it was a non-issue.**
-   I thought the `PipeBarrier<PIPE_ALL>` at the end of each grid-stride unit
-   cost about half of what grid-stride saves. Measured with repeats, it costs
-   nothing: 39.86/39.95 ms with the barriers against 40.25/39.97 without them
-   at T=4096 H=64, which is inside the noise. Narrowing them to `PIPE_MTE3`
-   also degraded race_probe from 6/6 to 5/6 clean, so the wide barrier stays.
-
-   The "half the gain" figure came from comparing single runs of two builds.
-   Between processes the same build varies about ±8% at this shape (0.1481,
-   0.1529, 0.1601 µs/token/head in three consecutive runs); within a process
-   the spread is 0.4–0.9%. `benchmarks/ab_compare.py` exists for this now:
-   9 timed repeats in one process, reported as median and spread. Any change
-   smaller than a few percent needs it.
-
+1. **Kernel1 is now the larger half** (~16 ms of 30 at T=4096 H=64). It has had
+   the launch and barrier work; what is left is the actual vector and cube work
+   per tile.
 2. **Kernel2's gemms are M=16.** `[16,128] × [128,128]` uses one row of
-   fractals per MMAD. Batching several chunks' gemms is not possible (the state
-   recurrence is sequential), but batching across *heads* is — heads are
-   independent, and 64 of them share the same chunk index.
-
-3. **Raise CHUNK from 16.** Chunk count drives kernel2's launch count directly
-   and 16 is the cube's minimum fractal. CHUNK=64 would cut launches 4× and
-   give each gemm 64 fractals of work. Large change: masks, buffer sizes, two
-   more Neumann factors.
-
-4. **Move FinishOut to the cube** (task #15). Would collapse 4 launches per
-   chunk to 2, but forces `k_dec@state` through bf16 before a cancelling
-   subtraction, so it trades precision — worth measuring, not worth assuming.
-
-5. **Shrink the workspace.** `H × total_tiles × 608 KB`; every scratch slot is
-   sized for a `[128,128]` fp32 state when only kernel2's state slots need it.
-   18.6 GB at T=8192 H=64.
+   fractals per MMAD. Heads are independent and 64 of them share a chunk index,
+   so batching across heads is possible; the state recurrence is what cannot
+   batch.
+3. **Raise CHUNK from 16.** Fewer, larger chunks: 16 is the cube's minimum
+   fractal. Large change — masks, buffer sizes, two more Neumann factors.
+4. **Move FinishOut to the cube** (task #15). Now much less attractive: it saved
+   launches, and launches are no longer the bottleneck.
 
 ## A note on the numbers above
 
