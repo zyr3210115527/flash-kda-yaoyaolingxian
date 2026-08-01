@@ -74,7 +74,10 @@ struct K1Ub {
     static constexpr uint32_t kDiff   = kColNeg + 1024;
     static constexpr uint32_t kMaskL  = kDiff + 1024;
     static constexpr uint32_t kMaskLE = kMaskL + 1024;
-    static constexpr uint32_t kEnd    = kMaskLE + 1024;
+    // A [CHUNK, D] fp32 scratch tile, for whole-tile decay and for broadcasting
+    // per-column vectors like dt_bias and g_total across rows.
+    static constexpr uint32_t kTile   = kMaskLE + 1024;
+    static constexpr uint32_t kEnd    = kTile + CHUNK * D * 4;
 };
 static_assert(K1Ub::kEnd < ArchTag::UB_SIZE, "kernel1 UB budget exceeded");
 
@@ -209,6 +212,12 @@ public:
             if (span.valid) {
                 Prepare(bufs, params, headIdx, span);
             }
+            // Units share one TPipe, so the pipelines are not drained between
+            // them the way a launch boundary would. Each phase was written
+            // assuming it owns the core for one unit; without this, iteration
+            // n+1 starts issuing while n's stores are still in flight, which
+            // showed up as ~40% of runs differing with inf in the workspace.
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 
@@ -235,6 +244,12 @@ public:
             if (span.valid) {
                 ComputeLAndMqk(bufs, params, headIdx, span);
             }
+            // Units share one TPipe, so the pipelines are not drained between
+            // them the way a launch boundary would. Each phase was written
+            // assuming it owns the core for one unit; without this, iteration
+            // n+1 starts issuing while n's stores are still in flight, which
+            // showed up as ~40% of runs differing with inf in the workspace.
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 
@@ -264,6 +279,12 @@ public:
             if (span.valid) {
                 MaskAndBuild(bufs, params, headIdx, span);
             }
+            // Units share one TPipe, so the pipelines are not drained between
+            // them the way a launch boundary would. Each phase was written
+            // assuming it owns the core for one unit; without this, iteration
+            // n+1 starts issuing while n's stores are still in flight, which
+            // showed up as ~40% of runs differing with inf in the workspace.
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 
@@ -290,6 +311,12 @@ public:
             if (span.valid) {
                 ComputeNeumann(bufs, params, headIdx, span);
             }
+            // Units share one TPipe, so the pipelines are not drained between
+            // them the way a launch boundary would. Each phase was written
+            // assuming it owns the core for one unit; without this, iteration
+            // n+1 starts issuing while n's stores are still in flight, which
+            // showed up as ~40% of runs differing with inf in the workspace.
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 
@@ -428,25 +455,41 @@ private:
         // Gate activation, then an inclusive cumsum down the rows. Rows past
         // the tail contribute nothing, which is what lets kernel 2 skip tail
         // masking entirely.
-        AscendC::Duplicate(gtot, 0.0f, D);
-        AscendC::PipeBarrier<PIPE_V>();
+        // Gate activation over the whole [CHUNK, D] tile. It is a pure
+        // elementwise map -- Cast, +dt_bias, *a, sigmoid, *gate_scale -- so the
+        // row loop only multiplied the barrier count. Only the cumsum that
+        // follows is genuinely sequential down rows.
+        auto bias16 = bufs.template Ub<float>(K1Ub::kTile);
         for (int r = 0; r < CHUNK; ++r) {
-            if (r < span.actualLen) {
-                AscendC::Cast(tmp, gb[r * D], AscendC::RoundMode::CAST_NONE, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Add(tmp, tmp, dtb, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(tmp, tmp, aExp, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                Sigmoid(bufs, tmp, tmp2, D);
-                AscendC::Muls(tmp, tmp, params.gate_scale, D);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Add(gtot, gtot, tmp, D);
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-            AscendC::Adds(gc[r * D], gtot, 0.0f, D);
+            AscendC::Adds(bias16[r * D], dtb, 0.0f, D);   // [D] -> [CHUNK, D]
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Cast(gc, gb, AscendC::RoundMode::CAST_NONE, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(gc, gc, bias16, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(gc, gc, aExp, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        Sigmoid(bufs, gc, bias16, CHUNK * D);            // bias16 as scratch
+        AscendC::Muls(gc, gc, params.gate_scale, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Tail rows must contribute nothing. The old loop achieved that by
+        // skipping them and re-storing the unchanged running total; zeroing
+        // them here makes the cumsum below carry across them identically.
+        for (int r = span.actualLen; r < CHUNK; ++r) {
+            AscendC::Duplicate(gc[r * D], 0.0f, D);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Inclusive cumsum down rows, in place.
+        for (int r = 1; r < CHUNK; ++r) {
+            AscendC::Add(gc[r * D], gc[r * D], gc[(r - 1) * D], D);
             AscendC::PipeBarrier<PIPE_V>();
         }
+        AscendC::Adds(gtot, gc[(CHUNK - 1) * D], 0.0f, D);
+        AscendC::PipeBarrier<PIPE_V>();
 
         // g_total is stored already exponentiated, as in CUDA; kernel 2 must
         // not exponentiate it a second time.
@@ -554,39 +597,57 @@ private:
         AscendC::Duplicate(kres, static_cast<BF16>(0.0f), CHUNK * D);
         AscendC::PipeBarrier<PIPE_V>();
 
-        for (int r = 0; r < span.actualLen; ++r) {
-            const int off = r * D;
+        // Whole-tile decay. Every step is elementwise over [CHUNK, D]; the row
+        // loop this replaces ran the same ops 128 elements at a time with a
+        // barrier between each -- about 224 barriers per tile.
+        //
+        // Same arithmetic per element, so the values are unchanged. Tail rows
+        // were skipped before and left at the zero fill above; here they are
+        // computed with the rest and re-zeroed at the end, which is the same
+        // result.
+        auto acc = bufs.template Ub<float>(K1Ub::kTile);
 
-            AscendC::Exp(tmp, gc[off], D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(tmp, tmp, kf[off], D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kdec[off], tmp, AscendC::RoundMode::CAST_RINT, D);
-            AscendC::PipeBarrier<PIPE_V>();
+        // k_decayed = k * exp(gc)
+        AscendC::Exp(tmp, gc, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(acc, tmp, kf, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(kdec, acc, AscendC::RoundMode::CAST_RINT, CHUNK * D);
 
-            AscendC::Exp(tmp, gc[off], D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(tmp, tmp, qf[off], D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(tmp, tmp, params.scale, D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(qdec[off], tmp, AscendC::RoundMode::CAST_RINT, D);
-            AscendC::PipeBarrier<PIPE_V>();
+        // q_decayed = q * exp(gc) * scale   (exp(gc) still in tmp)
+        AscendC::Mul(acc, tmp, qf, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Muls(acc, acc, params.scale, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(qdec, acc, AscendC::RoundMode::CAST_RINT, CHUNK * D);
 
-            AscendC::Muls(tmp, gc[off], -1.0f, D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Exp(tmp, tmp, D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Mul(tmp, tmp, kf[off], D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kinv[off], tmp, AscendC::RoundMode::CAST_RINT, D);
-            AscendC::PipeBarrier<PIPE_V>();
+        // k_inv = k * exp(-gc)
+        AscendC::Muls(tmp, gc, -1.0f, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Exp(tmp, tmp, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(acc, tmp, kf, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(kinv, acc, AscendC::RoundMode::CAST_RINT, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
 
-            AscendC::Mul(tmp, tmp, gtot, D);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Cast(kres[off], tmp, AscendC::RoundMode::CAST_RINT, D);
-            AscendC::PipeBarrier<PIPE_V>();
+        // k_restored = k_inv * g_total, with g_total a [D] row broadcast.
+        for (int r = 0; r < CHUNK; ++r) {
+            AscendC::Mul(acc[r * D], acc[r * D], gtot, D);
         }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(kres, acc, AscendC::RoundMode::CAST_RINT, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Rows past the tail carry no data.
+        for (int r = span.actualLen; r < CHUNK; ++r) {
+            AscendC::Duplicate(kdec[r * D], static_cast<BF16>(0.0f), D);
+            AscendC::Duplicate(qdec[r * D], static_cast<BF16>(0.0f), D);
+            AscendC::Duplicate(kinv[r * D], static_cast<BF16>(0.0f), D);
+            AscendC::Duplicate(kres[r * D], static_cast<BF16>(0.0f), D);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
     }
 
     CATLASS_DEVICE
