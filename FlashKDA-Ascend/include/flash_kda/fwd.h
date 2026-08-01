@@ -47,5 +47,6 @@ void launch_sync_small(int units, aclrtStream stream);
 void launch_aiv_only(GM_ADDR src, GM_ADDR dst, aclrtStream stream);
 void launch_aic_only(GM_ADDR flag, aclrtStream stream);
 void launch_sync_onearg(const FwdParams& params, aclrtStream stream);
+void launch_subblock_probe(const FwdParams& params, aclrtStream stream);
 
 }  // namespace flash_kda
