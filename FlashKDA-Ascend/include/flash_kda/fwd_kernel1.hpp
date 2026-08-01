@@ -67,7 +67,14 @@ struct K1Ub {
     static constexpr uint32_t kSmallB = kSmallA + 512;
     static constexpr uint32_t kReduce = kSmallB + 512;
     static constexpr uint32_t kScalar = kReduce + 1024;   // 32 sums at 8-float stride, then scratch
-    static constexpr uint32_t kEnd    = kScalar + 2048;
+    // Mask tiles for MaskAndBuild. Each is 16x16 fp32 = 1024 B; kColNeg holds
+    // only 16 floats but keeps the full slot so every base stays 32-byte
+    // aligned.
+    static constexpr uint32_t kColNeg = kScalar + 2048;
+    static constexpr uint32_t kDiff   = kColNeg + 1024;
+    static constexpr uint32_t kMaskL  = kDiff + 1024;
+    static constexpr uint32_t kMaskLE = kMaskL + 1024;
+    static constexpr uint32_t kEnd    = kMaskLE + 1024;
 };
 static_assert(K1Ub::kEnd < ArchTag::UB_SIZE, "kernel1 UB budget exceeded");
 
@@ -181,19 +188,27 @@ public:
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
         if (AscendC::GetSubBlockIdx() != 0) {
             return;
         }
-        const int headIdx = static_cast<int>(coreIdx) % params.H;
-        TileSpan span;
-        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
-        if (span.valid) {
-            K1AivBufs bufs;
-            Prepare(bufs, params, headIdx, span);
+        // grid-stride: one block per core, looping over (tile, head)
+        // units, rather than one block per unit. Dispatching a block
+        // per unit cost 0.60 ms of kernel1's 0.71 at T=1024 H=8 --
+        // more than every phase's compute put together.
+        //
+        // One TPipe for the whole kernel; everything per-unit is
+        // re-derived inside the loop, so units stay independent.
+        K1AivBufs bufs;
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+            const int headIdx = static_cast<int>(coreIdx) % params.H;
+            TileSpan span;
+            ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
+            if (span.valid) {
+                Prepare(bufs, params, headIdx, span);
+            }
         }
     }
 
@@ -202,16 +217,24 @@ public:
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
-        const int headIdx = static_cast<int>(coreIdx) % params.H;
-        TileSpan span;
-        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
-        if (span.valid) {
-            K1AicBufs bufs;
-            ComputeLAndMqk(bufs, params, headIdx, span);
+        // grid-stride: one block per core, looping over (tile, head)
+        // units, rather than one block per unit. Dispatching a block
+        // per unit cost 0.60 ms of kernel1's 0.71 at T=1024 H=8 --
+        // more than every phase's compute put together.
+        //
+        // One TPipe for the whole kernel; everything per-unit is
+        // re-derived inside the loop, so units stay independent.
+        K1AicBufs bufs;
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+            const int headIdx = static_cast<int>(coreIdx) % params.H;
+            TileSpan span;
+            ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
+            if (span.valid) {
+                ComputeLAndMqk(bufs, params, headIdx, span);
+            }
         }
     }
 
@@ -220,19 +243,27 @@ public:
         if constexpr (g_coreType != AscendC::AIV) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
         if (AscendC::GetSubBlockIdx() != 0) {
             return;
         }
-        const int headIdx = static_cast<int>(coreIdx) % params.H;
-        TileSpan span;
-        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
-        if (span.valid) {
-            K1AivBufs bufs;
-            MaskAndBuild(bufs, params, headIdx, span);
+        // grid-stride: one block per core, looping over (tile, head)
+        // units, rather than one block per unit. Dispatching a block
+        // per unit cost 0.60 ms of kernel1's 0.71 at T=1024 H=8 --
+        // more than every phase's compute put together.
+        //
+        // One TPipe for the whole kernel; everything per-unit is
+        // re-derived inside the loop, so units stay independent.
+        K1AivBufs bufs;
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+            const int headIdx = static_cast<int>(coreIdx) % params.H;
+            TileSpan span;
+            ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
+            if (span.valid) {
+                MaskAndBuild(bufs, params, headIdx, span);
+            }
         }
     }
 
@@ -241,16 +272,24 @@ public:
         if constexpr (g_coreType != AscendC::AIC) {
             return;
         }
-        const uint32_t coreIdx = AscendC::GetBlockIdx();
-        if (static_cast<int>(coreIdx) >= params.total_tiles * params.H) {
-            return;
-        }
-        const int headIdx = static_cast<int>(coreIdx) % params.H;
-        TileSpan span;
-        ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
-        if (span.valid) {
-            K1AicBufs bufs;
-            ComputeNeumann(bufs, params, headIdx, span);
+        // grid-stride: one block per core, looping over (tile, head)
+        // units, rather than one block per unit. Dispatching a block
+        // per unit cost 0.60 ms of kernel1's 0.71 at T=1024 H=8 --
+        // more than every phase's compute put together.
+        //
+        // One TPipe for the whole kernel; everything per-unit is
+        // re-derived inside the loop, so units stay independent.
+        K1AicBufs bufs;
+        const int units = params.total_tiles * params.H;
+        const uint32_t stride = AscendC::GetBlockNum();
+        for (uint32_t coreIdx = AscendC::GetBlockIdx();
+             static_cast<int>(coreIdx) < units; coreIdx += stride) {
+            const int headIdx = static_cast<int>(coreIdx) % params.H;
+            TileSpan span;
+            ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
+            if (span.valid) {
+                ComputeNeumann(bufs, params, headIdx, span);
+            }
         }
     }
 
@@ -650,39 +689,67 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)6);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)6);
         Sigmoid(bufs, bsig, bwrk, CHUNK);
-        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)4);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)4);
-
         // Mask exactly as fwd_kernel1.cuh:476-492:
         //   L   : i <= j -> 0 (diagonal included); i > j -> L * sigmoid(beta[i])
         //   INV : i == j -> 1; i < j -> 0; i > j -> -L_masked
         //   Mqk : i < j -> 0 (diagonal kept)
-        // Masks are built in fp32 scalars, in place, then converted to bf16 in
-        // one vector Cast each -- scalar bf16 casts are not representable.
-        for (int i = 0; i < CHUNK; ++i) {
-            const float bs = (i < span.actualLen) ? bsig.GetValue(i) : 0.0f;
-            for (int j = 0; j < CHUNK; ++j) {
-                float v;
-                if (i == j) {
-                    v = 1.0f;
-                } else if (i < j) {
-                    v = 0.0f;
-                } else {
-                    v = -(lf.GetValue(i * CHUNK + j) * bs);
-                }
-                lf.SetValue(i * CHUNK + j, v);
-                // L itself, strictly lower: the Neumann iteration squares this,
-                // and (I - L) cannot stand in for it since (I-L)^2 has extra
-                // terms. v already carries the sign flip, so negate it back.
-                lt.SetValue(i * CHUNK + j, (i > j) ? -v : 0.0f);
-                if (i < j) {
-                    mf.SetValue(i * CHUNK + j, 0.0f);
-                }
-            }
-        }
+        //
+        // Built with vector ops rather than a 16x16 scalar double loop. The
+        // masks are pure functions of (i, j): diff = i - j is integer-valued in
+        // fp32, so clamping it to [0, 1] lands exactly on 0.0 or 1.0 and the
+        // masks are exact.
+        //
+        // Destinations are whole tiles or row starts, which are 64 bytes apart
+        // and so always 32-byte aligned. Writing from [i*CHUNK + i] to express
+        // "diagonal onwards" would not be, hence the clamping.
+        auto colNeg = bufs.template Ub<float>(K1Ub::kColNeg);
+        auto diff = bufs.template Ub<float>(K1Ub::kDiff);
+        auto mL = bufs.template Ub<float>(K1Ub::kMaskL);
+        auto mLE = bufs.template Ub<float>(K1Ub::kMaskLE);
 
+        AscendC::ArithProgression(colNeg, 0.0f, -1.0f, CHUNK);   // -j
+        AscendC::PipeBarrier<PIPE_V>();
+        for (int i = 0; i < CHUNK; ++i) {
+            AscendC::Adds(diff[i * CHUNK], colNeg, static_cast<float>(i), CHUNK);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Maxs(mL, diff, 0.0f, CHUNK * CHUNK);            // i > j
+        AscendC::Adds(mLE, diff, 1.0f, CHUNK * CHUNK);           // i >= j
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(mL, mL, 1.0f, CHUNK * CHUNK);
+        AscendC::Maxs(mLE, mLE, 0.0f, CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mins(mLE, mLE, 1.0f, CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // All 16 sigmoid(beta) values in one scalar round trip, as before.
+        float bs[CHUNK];
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)4);
+        for (int i = 0; i < CHUNK; ++i) {
+            bs[i] = (i < span.actualLen) ? bsig.GetValue(i) : 0.0f;
+        }
         AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)4);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)4);
+
+        // lt = L * sigmoid(beta)[row], kept strictly lower. The Neumann
+        // iteration squares this, so it cannot be replaced by (I - L):
+        // (I - L)^2 = I - 2L + L^2.
+        for (int i = 0; i < CHUNK; ++i) {
+            AscendC::Muls(lt[i * CHUNK], lf[i * CHUNK], bs[i], CHUNK);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Mul(lt, lt, mL, CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // lf becomes (I - lt), with I = lowerInclusive - strictlyLower.
+        AscendC::Sub(lf, mLE, mL, CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sub(lf, lf, lt, CHUNK * CHUNK);
+        // Mqk keeps the diagonal, zeroes strictly above it.
+        AscendC::Mul(mf, mf, mLE, CHUNK * CHUNK);
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(sa, lf, AscendC::RoundMode::CAST_RINT, CHUNK * CHUNK);
         AscendC::Cast(sb, mf, AscendC::RoundMode::CAST_RINT, CHUNK * CHUNK);
         AscendC::PipeBarrier<PIPE_V>();
