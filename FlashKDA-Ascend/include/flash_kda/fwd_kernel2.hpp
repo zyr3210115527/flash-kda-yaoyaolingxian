@@ -385,7 +385,7 @@ private:
     int64_t Slot(Params const& params, int tileIdx, int headIdx, int i) const
     {
         return Ws(params, tileIdx, headIdx, WorkspaceOffsets::kScratch) +
-               static_cast<int64_t>(i) * WorkspaceSizes::kScratchSlot;
+               WorkspaceSizes::SlotOffset(i);
     }
 
     // The live state for this (sequence, head), in GM.

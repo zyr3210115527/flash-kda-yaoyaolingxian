@@ -397,7 +397,7 @@ private:
     int64_t Slot(TileSpan const& span, int headIdx, int i) const
     {
         return Ws(span, headIdx, WorkspaceOffsets::kScratch) +
-               static_cast<int64_t>(i) * WorkspaceSizes::kScratchSlot;
+               WorkspaceSizes::SlotOffset(i);
     }
 
     // ---------------- AIV round 1 ----------------

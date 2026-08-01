@@ -120,9 +120,39 @@ struct WorkspaceSizes {
     // Kernel 2 stages every AIC<->AIV handoff through these slots, because A2
     // has no L1<->UB path. The widest thing that crosses is the [D, D] state
     // update in fp32, so every slot is sized for that.
+    // Two slots hold a [D, D] state; the other seven hold at most a [CHUNK, D]
+    // tile. Sizing all nine for the state wasted 57% of the workspace -- 18.6 GB
+    // at T=8192 H=64, of which 97% was this scratch area.
+    //
+    //   wide (65536 B)   slot 3  state, bf16 [D, D]
+    //                    slot 7  k_res^T @ u, fp32 [D, D]
+    //   narrow (8192 B)  everything else: (I-L), Mqk, L, sigmoid(beta), v/u,
+    //                    k_dec@state, q_dec@state, Mqk@u -- all [CHUNK, D] or
+    //                    smaller
+    //
+    // The wide slots come first so their offsets stay 64 KB-aligned.
     static constexpr int kScratchSlot = D * D * sizeof(FP32);          // 65536
-    static constexpr int kNumScratch  = 9;
-    static constexpr int kScratch     = kScratchSlot * kNumScratch;
+    static constexpr int kNarrowSlot  = CHUNK * D * sizeof(FP32);      // 8192
+    static constexpr int kNumWide     = 2;
+    static constexpr int kNumNarrow   = 7;
+    static constexpr int kNumScratch  = kNumWide + kNumNarrow;
+    static constexpr int kScratch     = kScratchSlot * kNumWide +
+                                        kNarrowSlot * kNumNarrow;
+
+    // Slot index -> byte offset within a tile's scratch area. Slots 3 and 7
+    // are the wide ones and are laid out first; the rest follow as narrow
+    // tiles. Callers keep using the slot numbers they always did, so this is
+    // the only place that knows which are which.
+    //
+    // A member rather than a free function: a plain constexpr free function in
+    // this header is not visible to device code on this toolchain.
+    static constexpr int SlotOffset(int i)
+    {
+        return (i == 3) ? 0
+             : (i == 7) ? kScratchSlot
+             : kScratchSlot * kNumWide +
+               kNarrowSlot * ((i < 3) ? i : (i < 7) ? (i - 1) : (i - 2));
+    }
 
     static constexpr int64_t kPerTile =
         kKDecayed + kQDecayed + kKInv + kKRestored + kGTotal + kINV + kMqk + kIdentity + kScratch;
