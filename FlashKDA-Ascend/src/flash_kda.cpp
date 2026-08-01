@@ -272,18 +272,7 @@ int64_t sync_onearg(int64_t n, int64_t h) {
     return 0;
 }
 
-int64_t subblock_probe(int64_t n, int64_t h) {
-    FwdParams params{};
-    params.N = int(n);
-    params.H = int(h);
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
-    flash_kda::launch_subblock_probe(params, stream);
-    return 0;
-}
-
 PYBIND11_MODULE(_C, m) {
-    m.def("subblock_probe", &subblock_probe, "both-AIV-subblocks handshake probe",
-          py::arg("n"), py::arg("h"));
     // Tests and benchmarks read the chunk size from here rather than
     // hardcoding it. A dozen files had their own `CHUNK = 16`, which is exactly
     // how a test silently stops matching the kernel it is checking.

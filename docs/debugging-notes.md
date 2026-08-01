@@ -191,3 +191,52 @@ which first goes bad, using the exported offsets.
 Reverted to CHUNK=16. The parameterization is kept: it makes the next attempt a
 matter of fixing strides and re-basing the decay, rather than untangling
 constants first.
+
+## MIX_AIC_1_2: six attempts, and why it is parked (2026-08-02)
+
+Motivation, from the hardware counters: AIC and AIV **alternate rather than
+overlap** — for kernel2 at T=4096 H=64, AIC's busy pipes total 4.78 ms and AIV
+is busy 6.65 ms against a 13.2 ms kernel, i.e. their sum. A2 pairs each cube
+core with two vector cores, and the profiler confirms the runtime hands out the
+1:2 default to an unannotated kernel (`FlashKdaK2InitState`: Block Dim 64, Mix
+Block Dim 128) while our `MIX_AIC_1_1` kernels get 64. So declaring 1_1 halves
+the vector cores available. Using the second one should cut the AIV half.
+
+What was tried, in order:
+
+1. **Switch the macro to `MIX_AIC_1_2`.** Deadlock (>10 min, processes killed).
+   The AIV phases open with `if (GetSubBlockIdx() != 0) return;`, so subblock 1
+   leaves without participating and the AIC waits for a partner that never
+   arrives.
+2. **Only subblock 0 handshakes; the pair rendezvous with
+   `CrossCoreBarrier<0x1>` (AIV_INTER_SUBBLOCK_BARRIER).** Also deadlocks. So
+   one subblock cannot signal on behalf of both.
+3. **Both subblocks handshake symmetrically, in an isolated probe.** Works —
+   three runs each at blockDim 1, 8, 64, 64, 256. This is the rule:
+   `CrossCoreSetFlag<0x2>` is not satisfied until *every* AIV in the group has
+   set the flag.
+4. **Real kernel1, work split across subblocks** (`start = blockIdx`,
+   `stride = blockNum * subBlockNum`). Builds, runs, no deadlock — but NaN,
+   1/12.
+5. **Real kernel1, 1_2 handshake but the original single-subblock work split.**
+   Also 1/12. So the mode change alone breaks it; the split is not the fault.
+6. **AIC waits once per AIV** (`kAivPerAic` times per phase), on the theory
+   that two sets against one wait leave a pending flag that releases the next
+   phase early. Deadlock.
+
+Conclusion: the flag semantics that hold in an isolated probe do not carry over
+once phases have real data dependencies, and I could not find the correct
+pairing in six attempts. The isolated probe passing (3) is exactly why it is
+worth recording — it is a false positive for the real kernel, and repeating it
+proves nothing.
+
+Measured indexing under 1_2, which is correct and reusable: on the AIV side
+`GetBlockNum()` returns the **cube** block count, `GetSubBlockNum()` is 2, and
+`blockIdx` runs over twice the cube blocks with `subBlockIdx = blockIdx % 2`.
+Obtained by writing the values to GM — device `printf` needs `ENABLE_PRINTF()`
+*and* a host-side dump buffer that is not configured here, so it stays silent.
+
+Parked at `MIX_AIC_1_1`, 21.63 ms, 12/12, 6/6 clean race probes. The prize is
+real (perfect overlap would put kernel2 near 6.6 ms rather than 13.2), but it
+needs the actual flag protocol for 1:2, which likely means a documentation
+source rather than more black-box probing.
