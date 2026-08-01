@@ -29,6 +29,8 @@
 #include "flash_kda/utils.hpp"
 
 #include "catlass/arch/arch.hpp"
+// RunFusedAll hands off between AIC and AIV with cross-core flags.
+#include "catlass/arch/cross_core_sync.hpp"
 #include <type_traits>
 
 #include "kernel_operator.h"
@@ -330,6 +332,132 @@ public:
             }
             BuildU(bufs, params, sp.headIdx, tileIdx + 1,
                    sp.bos + (chunk + 1) * CHUNK, nlen);
+        }
+    }
+
+    // The whole recurrence in one kernel: chunk loop inside, AIC/AIV handoffs
+    // by cross-core flag instead of launch boundary.
+    //
+    // Launch overhead is 54% of the pipeline and device-side (~5.2 us each,
+    // 2051 launches at T=8192 H=64), and every one of kernel2's launch
+    // boundaries existed only to hand off between core types. Cross-core sync
+    // needs KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1) on the entry --
+    // without a declared task type the runtime never provisions FFTS sync and
+    // the first wait hangs, which is what made two earlier attempts conclude it
+    // does not work.
+    //
+    // Both core types run this loop and alternate. The ordering is exactly what
+    // the separate launches provided, so the arithmetic is unchanged.
+    CATLASS_DEVICE
+    void RunFusedAll(Params const& params)
+    {
+        AscendC::SetSyncBaseAddr(params.sync_base_addr);
+
+        Catlass::Arch::CrossCoreFlag aivReady{1};
+        Catlass::Arch::CrossCoreFlag aicReady{2};
+
+        SeqSpan sp = Locate(params, g_coreType == AscendC::AIV);
+
+        // Every block must keep handshaking until the longest sequence is done,
+        // even after its own is finished: its peer is waiting on it. Blocks
+        // past their own end set their flags and skip the work.
+        const int maxChunks = params.total_tiles;
+
+        if constexpr (g_coreType == AscendC::AIV) {
+            if (AscendC::GetSubBlockIdx() != 0) {
+                return;
+            }
+            K2AivBufs bufs;
+
+            if (sp.valid) {
+                InitState(bufs, params, sp.seqIdx, sp.headIdx);
+                int len0 = sp.seqLen;
+                if (len0 > CHUNK) {
+                    len0 = CHUNK;
+                }
+                if (sp.nTiles > 0) {
+                    // BuildU ends with StateToBf16, which is what seeds slot 3
+                    // for the first PreGemms.
+                    BuildU(bufs, params, sp.headIdx, sp.tileBase, sp.bos, len0);
+                }
+            }
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
+
+            for (int c = 0; c < maxChunks; ++c) {
+                const bool live = sp.valid && c < sp.nTiles;
+                int len = 0;
+                int tileIdx = 0;
+                if (live) {
+                    len = sp.seqLen - c * CHUNK;
+                    if (len > CHUNK) {
+                        len = CHUNK;
+                    }
+                    tileIdx = sp.tileBase + c;
+                }
+
+                // AIC is running PreGemms(c).
+                Catlass::Arch::CrossCoreWaitFlag(aicReady);
+                if (live) {
+                    FinishOut(bufs, params, sp.headIdx, tileIdx,
+                              sp.bos + c * CHUNK, len);
+                }
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
+
+                // AIC is running PostGemms(c).
+                Catlass::Arch::CrossCoreWaitFlag(aicReady);
+                if (live) {
+                    StoreOut(bufs, params, sp.headIdx, tileIdx,
+                             sp.bos + c * CHUNK, len);
+                    DecayState(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
+                    if (c + 1 < sp.nTiles) {
+                        // Same pairing the merged launch used: BuildU for the
+                        // next chunk runs here, after DecayState has produced
+                        // the state its StateToBf16 reads.
+                        AscendC::PipeBarrier<PIPE_ALL>();
+                        int nlen = sp.seqLen - (c + 1) * CHUNK;
+                        if (nlen > CHUNK) {
+                            nlen = CHUNK;
+                        }
+                        BuildU(bufs, params, sp.headIdx, tileIdx + 1,
+                               sp.bos + (c + 1) * CHUNK, nlen);
+                    }
+                }
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
+            }
+
+            if (sp.valid && params.has_state_out != 0) {
+                // StoreFinalState reads the state back from GM, and the last
+                // chunk's DecayState wrote it from this same core moments ago.
+                // As a separate launch that ordering was free; inside one
+                // kernel the store must retire before the load is issued.
+                AscendC::PipeBarrier<PIPE_ALL>();
+                StoreFinalState(bufs, params, sp.seqIdx, sp.headIdx);
+            }
+        } else {
+            K2AicBufs bufs;
+
+            // AIV is doing InitState and BuildU(0).
+            Catlass::Arch::CrossCoreWaitFlag(aivReady);
+
+            for (int c = 0; c < maxChunks; ++c) {
+                const bool live = sp.valid && c < sp.nTiles;
+                const int tileIdx = live ? (sp.tileBase + c) : 0;
+
+                if (live) {
+                    PreGemms(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
+                }
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
+
+                // AIV is running FinishOut(c).
+                Catlass::Arch::CrossCoreWaitFlag(aivReady);
+                if (live) {
+                    PostGemms(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
+                }
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
+
+                // AIV is running FinishChunk(c) and BuildU(c+1).
+                Catlass::Arch::CrossCoreWaitFlag(aivReady);
+            }
         }
     }
 
