@@ -208,6 +208,15 @@ void fwd(
         return (e == nullptr || e[0] != '0') ? 1 : 0;
     }();
     params.l1_neumann = kL1Neumann;
+
+    static const int kFastNorm = [] {
+        // Default on: 21.71 ms against 22.52 at T=4096 H=64, and the 12 shape
+        // errors are byte-identical despite the reassociation.
+        // FLASH_KDA_FAST_NORM=0 selects the row-at-a-time reduction.
+        const char *e = std::getenv("FLASH_KDA_FAST_NORM");
+        return (e == nullptr || e[0] != '0') ? 1 : 0;
+    }();
+    params.fast_norm = kFastNorm;
     params.state_fp32 = state_fp32 ? 1 : 0;
     params.is_varlen = is_varlen ? 1 : 0;
     params.chunk_idx = 0;

@@ -537,7 +537,11 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         // L2 normalize in fp32 and round once on the way out, as CUDA does.
-        NormalizeAll(bufs, qf, kf, tmp, span.actualLen);
+        if (params.fast_norm != 0) {
+            NormalizeAllFast(bufs, qf, kf, tmp, span.actualLen);
+        } else {
+            NormalizeAll(bufs, qf, kf, tmp, span.actualLen);
+        }
 
         AscendC::GlobalTensor<float> gmALog;
         gmALog.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.A_log));
@@ -606,6 +610,70 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)2);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)2);
         return pad.GetValue(0);
+    }
+
+    // L2-normalize q and k, reducing all 16 rows per tensor in one instruction.
+    //
+    // The row-at-a-time version below issues 32 ReduceSum calls per tile, each
+    // reducing one 128-element row as its own serialized vector op. That is
+    // 2.23 ms of Prepare's 4.5 at T=4096 H=64 -- the largest single piece of
+    // kernel1. Its scalar round trips were already batched to one V_S/S_V pair,
+    // which is why doing that earlier bought nothing measurable: the reductions
+    // were the cost, not the flushes.
+    //
+    // WholeReduceSum collapses one repeat to one value and takes a repeatTime,
+    // so one call covers the whole tile. A repeat is 64 fp32 lanes and a row is
+    // 128 elements, so each row is two repeats: 32 repeats give 32 partials,
+    // two adjacent per row, summed on the scalar side where they are already
+    // being read.
+    //
+    // Not bit-exact with the version below: that sums a 128-element row in
+    // whatever order ReduceSum's tree uses, this sums two 64-element halves and
+    // adds them. Same values, different association. The result feeds a
+    // reciprocal square root, which damps rather than amplifies.
+    CATLASS_DEVICE
+    void NormalizeAllFast(K1AivBufs& bufs, AscendC::LocalTensor<float> qf,
+                          AscendC::LocalTensor<float> kf,
+                          AscendC::LocalTensor<float> tmp, int rows)
+    {
+        auto part = bufs.template Ub<float>(K1Ub::kReduce);
+
+        constexpr int kHalves = D / 64;            // repeats per row
+        constexpr int kRepeats = CHUNK * kHalves;  // 32
+
+        // Strides are in 32-byte blocks: a 64-lane fp32 repeat spans 8 of them.
+        AscendC::Mul(tmp, qf, qf, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceSum<float>(part, tmp, 64, kRepeats, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Mul(tmp, kf, kf, CHUNK * D);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::WholeReduceSum<float>(part[kRepeats], tmp, 64, kRepeats, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::SetFlag<AscendC::HardEvent::V_S>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>((event_t)0);
+        float invq[CHUNK];
+        float invk[CHUNK];
+        for (int r = 0; r < rows; ++r) {
+            float sq = 0.0f;
+            float sk = 0.0f;
+            for (int h = 0; h < kHalves; ++h) {
+                sq += part.GetValue(r * kHalves + h);
+                sk += part.GetValue(kRepeats + r * kHalves + h);
+            }
+            invq[r] = 1.0f / sqrt(sq + 1e-6f);
+            invk[r] = 1.0f / sqrt(sk + 1e-6f);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>((event_t)1);
+
+        for (int r = 0; r < rows; ++r) {
+            AscendC::Muls(qf[r * D], qf[r * D], invq[r], D);
+            AscendC::Muls(kf[r * D], kf[r * D], invk[r], D);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     CATLASS_DEVICE

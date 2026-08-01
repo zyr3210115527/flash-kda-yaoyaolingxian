@@ -232,6 +232,10 @@ struct FwdParams {
     // Keep the Neumann chain's intermediates in L1 instead of round-tripping
     // them through GM. Set from FLASH_KDA_L1_NEUMANN.
     int l1_neumann;
+
+    // Reduce all 16 rows in one WholeReduceSum rather than 16 ReduceSum calls.
+    // Set from FLASH_KDA_FAST_NORM.
+    int fast_norm;
     int state_fp32;
     int is_varlen;
 };
