@@ -135,3 +135,59 @@ results" were a stale binary.
 - **Backward pass.** Not started; this is forward only.
 - **Ascend 950 (`CATLASS_ARCH=3510`).** Only 910B has been exercised.
 - **Larger D.** `D == 128` is asserted host-side.
+
+## Why CHUNK cannot simply be raised (measured 2026-08-01)
+
+Hardware counters put the cube at 2–3% MAC utilization with memory-in as its
+busiest pipe: it is fetching operands, not computing, because CHUNK=16 makes
+every matmul one fractal row. Raising CHUNK is the only change that lifts that,
+so it was worth attempting.
+
+The plumbing side went fine, and is neutral at CHUNK=16 (12/12 with identical
+errors, 21.72 ms unchanged). CHUNK is now a real knob: the Neumann series
+derives its length from `kLog2Chunk` instead of four hardcoded factors, the
+16×16 tiles in K1L1/K1Ub are sized `CHUNK*CHUNK`, `repeatTimes` is
+`(CHUNK/16)^2` rather than 1 in five places, kernel2's `kNarrow` overlays the
+front buffers so UB still fits, and tests read `CHUNK` and the workspace offsets
+from the extension instead of each keeping a copy.
+
+CHUNK=32 builds and runs and produces NaN everywhere. Two separate causes.
+
+**1. The decay representation overflows fp32 — not a bug.**
+
+`k_inv = k * exp(-cumsum(gate))`, and the gate is clamped at `lower_bound` per
+token, so the exponent reaches `|lower_bound| * CHUNK`. Sweeping the clamp at
+CHUNK=32 tracks it exactly:
+
+| lower_bound | exponent | k_inv absmax |
+|---|---|---|
+| −5.0 | e^160 | inf |
+| −2.0 | e^64 | 1.98e+20 |
+| −1.0 | e^32 | 5.27e+09 |
+
+At CHUNK=16 with the usual −5.0 that is e^80 = 5.5e34, just inside fp32's
+3.4e38. At CHUNK=32 it is e^160, which is not.
+
+So **CHUNK=16 in the CUDA reference is not an arbitrary tile choice** — it is
+about the largest chunk for which this formulation stays in fp32 range at
+lower_bound=−5. Raising it needs the decay re-based within the chunk (subtract
+a per-chunk reference exponent, fold it into the state update) rather than
+just bigger tiles. That changes the math, so both oracles follow.
+
+**2. A layout bug on top of it.**
+
+INV is NaN even at lower_bound=−1.0, where k_inv is 5.27e9 and every input is
+finite. Something in the Neumann chain is still 16×16-specific beyond
+`repeatTimes` — most likely the Nd2Nz or Fixpipe strides in the Gemm16 family,
+which assume a single fractal where `srcStride`/`dstStride` of CHUNK happen to
+coincide with the zN layout. `LoadBt`'s `ldb.srcStride = 1` carries a comment
+that 8 "made a working single tile hang", which is the same class of
+hardcoding, and is what task #8 (replace hand-rolled fractal strides with
+catlass tile classes) is about.
+
+`tests/chunk32_probe.py` dumps each kernel1 field for a one-tile case and says
+which first goes bad, using the exported offsets.
+
+Reverted to CHUNK=16. The parameterization is kept: it makes the next attempt a
+matter of fixing strides and re-basing the decay, rather than untangling
+constants first.
