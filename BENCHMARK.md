@@ -35,8 +35,8 @@ zeros and copied it, and ~20 GB does not go through the host:
 
 | T | H | workspace | ours ms | CUDA/H20 ms | ratio |
 |---:|---:|---:|---:|---:|---:|
-| 8192 | 64 | 6.3 G | 61.03 | 1.6217 | **38×** |
-| 8192 | 96 | 9.5 G | 85.70 | 2.6220 | **33×** |
+| 8192 | 64 | 6.3 G | 45.49 | 1.6217 | **28×** |
+| 8192 | 96 | 9.5 G | 62.18 | 2.6220 | **24×** |
 
 Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
 about 0.180 from H=64 onward, so this is a stable figure rather than one that
@@ -98,34 +98,35 @@ work.
 
 ## What was tried
 
-Measured, in order, with the outcome rather than the prediction:
+Measured, in order, outcome rather than prediction. Started at 790× (a harness
+artifact), and the real starting point was ~94×.
 
-1. **Batch the L2 normalization** — no change. Kept; chosen by reasoning, which
-   is why it missed.
-2. **Grid-stride kernel1, first attempt** — no change, reverted. Correct then:
-   compute still dominated.
-3. **Fuse the Neumann series** — kernel1 0.97 → 0.76 ms. 16 cube round trips,
-   10 of them `X * I` copies, became 6.
-4. **Fold BuildU into the previous FinishChunk** — 5 launches per chunk → 4.
-5. **Stop reallocating the workspace** — 29.96 → 2.73 ms end-to-end, ~11×.
-6. **Vectorize the mask** — exact, almost no time, but it exposed that dispatch
-   had become 85% of kernel1.
-7. **Grid-stride again + batch the row loops** — 86.54 → 80.03 ms.
-8. **Size the scratch slots to what they hold** — workspace 18.6 → 6.3 GB, and
-   80.03 → 76.58 ms.
-9. **Declare kernel task types** — ~1.7%. Every phase runs on one core type,
-   but without `KERNEL_TASK_TYPE_DEFAULT` each launch starts blocks on both.
-10. **Fuse kernel2 into one kernel** — the big one. 77.00 → 61.23 ms, 47× → 38×.
-11. **Fuse kernel1** — 0.3%, its four launches were per call, not per chunk.
+| | effect |
+|---|---|
+| Batch the L2 normalization | none; kept (exact, less code) |
+| Grid-stride kernel1, first attempt | none, reverted — correct then, compute still dominated |
+| Fuse the Neumann series | kernel1 0.97 → 0.76 ms |
+| Fold BuildU into the previous FinishChunk | 5 launches/chunk → 4 |
+| Stop reallocating the workspace | 29.96 → 2.73 ms end-to-end, ~11× |
+| Vectorize the mask | ~none, but exposed that dispatch was 85% of kernel1 |
+| Grid-stride again + batch the row loops | 86.54 → 80.03 ms |
+| Size scratch slots to what they hold | workspace 18.6 → 6.3 GB, 80.03 → 76.58 ms |
+| Declare kernel task types | ~1.7% |
+| **Fuse kernel2 into one kernel** | **77.00 → 61.23 ms, 47× → 38×** |
+| Fuse kernel1 | 0.3% |
+| **Keep the Neumann chain in L1** | **61.03 → 47.90 ms, 38× → 30×** |
+| **Keep the state in UB across chunks** | **47.90 → 45.49 ms, 30× → 28×** |
 
-Discarded after measuring (all interleaved, all no change):
+Discarded after measuring (all interleaved, all no change at the time):
 
 - batching DecayState's 128-iteration scalar loop — the flushes were not the
-  cost;
-- casting the state from UB instead of re-reading 64 KB from GM — 2.0 GB of
-  reads removed, worth nothing, because the data was L2-resident;
+  cost, the bandwidth was;
+- casting the state from UB instead of re-reading GM — worthless while launches
+  dominated and the data was L2-resident. The same idea paid later, once the
+  structure around it had changed. **A negative result is only valid against
+  the configuration it was measured in.**
 - narrowing the grid-stride barrier to `PIPE_MTE3` — also degraded race_probe
-  from 6/6 to 5/6.
+  from 6/6 to 5/6 clean.
 
 ## The measurement that redirected everything
 
