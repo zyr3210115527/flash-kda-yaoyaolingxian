@@ -173,22 +173,44 @@ anything. A clean single run is not evidence.
 ## Where it stands, and the ceiling
 
 At T=4096 H=64: kernel1 8.47 ms, kernel2 13.2 ms, 21.70 ms total. Both are
-single fused kernels now, so all of that is real work rather than dispatch.
+single fused kernels, so all of that is real work rather than dispatch.
 
-The pipeline does 30.9 GFLOP at this shape, so 21.70 ms is **1.42 TFLOP/s
-against the 910B3's ~376 TFLOP/s bf16 peak — 0.38%.**
+Hardware counters (`benchmarks/profile_pipes.py`, AiCMetrics.PipeUtilization)
+say what is actually busy:
 
-That number is the whole story of what is left. It is not a tuning gap; it is
-structural. Every matmul in the algorithm has m=16, one fractal row, because
-CHUNK=16:
+|  | kernel1 | kernel2 |
+|---|---:|---:|
+| `aic_mac_ratio` (cube MACs) | 0.03 | 0.02 |
+| `aic_mte2_ratio` (cube memory-in) | 0.24 | 0.244 |
+| `aiv_vec_ratio` | 0.405 | 0.218 |
+| `aiv_scalar_ratio` | 0.326 | 0.306 |
 
-    kernel1   [16,128]x[128,16] twice, then six 16x16x16
-    kernel2   [16,128]x[128,128] twice, [16,16]x[16,128] twice,
-              [128,16]x[16,128] once
+Two things that only the counters could show.
 
-The cube reaches peak on bulk 16x16x16 fractals, and this issues them one row
-at a time with a full operand-load and drain around each. Latency-bound by
-construction.
+**The cube is idle, not slow.** MACs at 2–3% while its busiest pipe is
+memory-in. It is fetching operands, not computing. That is the m=16 problem in
+hardware terms: CHUNK=16 makes every matmul one fractal row, wrapped in a full
+operand load and drain.
+
+**A third of vector-core time is spent in the scalar unit** — in kernel2, more
+than the vector unit itself. That is a whole cost class the earlier method
+(wall clock + stubbing + arithmetic on transfer sizes) was blind to.
+
+For scale, the pipeline does 30.9 GFLOP at this shape, so 21.70 ms is
+1.42 TFLOP/s against a ~376 TFLOP/s bf16 peak. But that ratio overstates the
+headroom: this algorithm is memory- and latency-bound, and
+[Parallel Scan on Ascend AI Accelerators](https://arxiv.org/abs/2505.15112)
+(Huawei Zurich, IPDPS 2025) reports that even a carefully tuned Ascend kernel
+reaches ~37.5% of theoretical memory bandwidth. Compute peak is not the right
+yardstick here.
+
+That paper also independently confirms two things this port had to discover the
+hard way: on 910B, AIC and AIV can exchange data *only* through global memory or
+L2 — there is no L1↔UB path — and a prefix sum can be re-expressed as a
+multiply by an upper-triangular all-ones matrix, which is a cube-side
+alternative to the sequential cumsum in `Prepare` (0.21 ms, so not currently
+worth the AIV→AIC→AIV round trip, but the right shape if `Prepare` is ever
+restructured).
 
 ## What to do next
 
