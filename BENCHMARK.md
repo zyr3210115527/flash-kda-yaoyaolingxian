@@ -145,11 +145,19 @@ anything. A clean single run is not evidence.
 
 ## What to do next
 
-1. **Cheaper inter-unit sync in kernel1.** The grid-stride loop currently ends
-   each unit with `PipeBarrier<PIPE_ALL>`, which costs roughly half of what
-   grid-stride saves. The phases only need their own pipes drained, so
-   per-queue barriers should recover most of that. Correctness first: this is
-   the sync that was missing, so any change needs several race_probe runs.
+1. ~~Cheaper inter-unit sync in kernel1.~~ **Done, and it was a non-issue.**
+   I thought the `PipeBarrier<PIPE_ALL>` at the end of each grid-stride unit
+   cost about half of what grid-stride saves. Measured with repeats, it costs
+   nothing: 39.86/39.95 ms with the barriers against 40.25/39.97 without them
+   at T=4096 H=64, which is inside the noise. Narrowing them to `PIPE_MTE3`
+   also degraded race_probe from 6/6 to 5/6 clean, so the wide barrier stays.
+
+   The "half the gain" figure came from comparing single runs of two builds.
+   Between processes the same build varies about ±8% at this shape (0.1481,
+   0.1529, 0.1601 µs/token/head in three consecutive runs); within a process
+   the spread is 0.4–0.9%. `benchmarks/ab_compare.py` exists for this now:
+   9 timed repeats in one process, reported as median and spread. Any change
+   smaller than a few percent needs it.
 
 2. **Kernel2's gemms are M=16.** `[16,128] × [128,128]` uses one row of
    fractals per MMAD. Batching several chunks' gemms is not possible (the state
