@@ -35,8 +35,8 @@ zeros and copied it, and ~20 GB does not go through the host:
 
 | T | H | workspace | ours ms | CUDA/H20 ms | ratio |
 |---:|---:|---:|---:|---:|---:|
-| 8192 | 64 | 6.3 G | 43.94 | 1.6217 | **27×** |
-| 8192 | 96 | 9.5 G | 59.88 | 2.6220 | **23×** |
+| 8192 | 64 | 6.3 G | 43.84 | 1.6217 | **27×** |
+| 8192 | 96 | 9.5 G | 59.69 | 2.6220 | **23×** |
 
 Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
 about 0.180 from H=64 onward, so this is a stable figure rather than one that
@@ -214,30 +214,41 @@ restructured).
 
 ## What to do next
 
-1. **Raise CHUNK.** The only change that lifts the 0.38% ceiling, because it is
-   the only one that makes the gemms bigger. CHUNK=64 would give each matmul 4x
-   the m dimension and cut tile count 4x.
+Ordered by what the counters say is actually there, not by ease.
 
-   It is a real refactor, not a constant change. The code is largely
-   CHUNK-parameterized already, but the Neumann series is not: it uses exactly
-   four factors, `(I-L)(I+L^2)(I+L^4)(I+L^8)`, which terminates only because L
-   is strictly lower triangular and 16x16, so L^16 = 0. CHUNK=32 needs five
-   factors, CHUNK=64 needs six. Mask construction, buffer sizes, and the L1
-   Neumann slots all follow from that.
+1. **Overlap AIC and AIV.** The single biggest item. They alternate rather than
+   overlap — kernel2 at T=4096 H=64 spends 4.78 ms of AIC pipe time and 6.65 ms
+   of AIV time in a 13.2 ms kernel, i.e. their sum. Perfect overlap would put
+   kernel2 near 6.6 ms.
 
-   It also changes what "correct" means: the CUDA reference and `torch_ref.py`
-   both use CHUNK=16 and reproduce its rounding step by step, so a different
-   chunk size cannot be validated against them directly. That needs settling
-   first -- probably by keeping CHUNK=16 as the validated path and treating a
-   larger chunk as a separate configuration with its own oracle.
+   Two routes, both blocked for now:
+   - *Use the second vector core* (A2 is 1 cube : 2 vector, and declaring
+     `MIX_AIC_1_1` halves what the runtime hands out). Six attempts, all in
+     `docs/debugging-notes.md`. The sync rule found — `CrossCoreSetFlag<0x2>`
+     needs every AIV in the group to set — is correct in an isolated probe but
+     the same pattern gives NaN in the real kernel. Needs the actual 1:2 flag
+     protocol, i.e. a documentation source rather than more probing.
+   - *Two independent (sequence, head) units per block*, so the cube works on
+     one while the vector unit works on the other. Blocked on UB: two resident
+     states is 128 KB of 192 KB.
 
-2. **PostGemms' three gemms** (3.6 ms) chain through GM via `uu`. The L1 trick
-   that worked for Neumann does not transfer: `uu` is `[16,128]` and feeds a B
-   operand in zZ layout, while Fixpipe writes row-major. Neumann only worked
-   because a 16x16 tile is a single fractal where the two layouts coincide.
+2. **Raise CHUNK**, which is what lifts the cube off 2–3% MAC utilization. Two
+   things in the way, both now understood (see `docs/debugging-notes.md`):
+   the decay representation overflows fp32 past CHUNK=16 at lower_bound=−5, so
+   it needs re-basing within the chunk; and a 16×16-specific stride remains in
+   the Gemm16 family. Re-basing around the chunk midpoint buys exactly one
+   doubling — enough for CHUNK=32.
 
-3. **Prepare's loads** (0.74 ms) and **Decay** (0.66 ms) are what remain in
-   kernel1 after NormalizeAll. Small, and both are already whole-tile.
+3. **The scalar unit** is ~31% of vector-core time in both kernels, more than
+   the vector unit itself in kernel2. Moving individual operations does not
+   help (tried, `Rsqrt`: correct but slower, because getting values to the
+   vector unit and back costs more than the scalar op saved). It needs a
+   restructuring that stops crossing the scalar/vector boundary at all.
+
+4. **Double-buffer the AIC's L1 loads.** `aic_mte2_ratio` is 0.24 and L1 has
+   ~496 KB spare, so the next unit's operands could be prefetched during the
+   current one's Mmad. Modest — bounded by the AIC half of an alternating
+   kernel.
 
 ## A note on the numbers above
 
