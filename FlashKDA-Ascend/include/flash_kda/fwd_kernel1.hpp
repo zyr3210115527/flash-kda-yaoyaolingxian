@@ -215,15 +215,32 @@ public:
         const int units = params.total_tiles * params.H;
 
         if constexpr (g_coreType == AscendC::AIV) {
-            if (AscendC::GetSubBlockIdx() != 0) {
-                return;
-            }
+            // Both AIV subblocks work, and both handshake.
+            //
+            // CrossCoreSetFlag mode 0x2 synchronises AIC and AIV *within one
+            // AI Core* -- two AIVs waiting on one AIC -- so the two vector
+            // cores on a core must work on the same units their own cube core
+            // is working on. Assigning AIV blocks to units globally (block i ->
+            // unit i) breaks that pairing: the AIVs on core j would be on units
+            // 2j and 2j+1 while its AIC is on unit j, and the per-unit phase
+            // order is violated. That produced correct output only for the
+            // single-unit shape.
+            //
+            // So each core walks its own unit sequence (start = core index,
+            // stride = cube block count, exactly as the AIC does) and the two
+            // subblocks take alternate entries of that sequence.
             K1AivBufs bufs;
+            const uint32_t nsub = AscendC::GetSubBlockNum();
+            const uint32_t sub = AscendC::GetBlockIdx() % nsub;
             const uint32_t stride = AscendC::GetBlockNum();
-            const uint32_t start = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+            const uint32_t start = AscendC::GetBlockIdx() / nsub;
 
             // Prepare for every unit this block owns, then hand to the cube.
-            for (uint32_t i = start; static_cast<int>(i) < units; i += stride) {
+            uint32_t k = 0;
+            for (uint32_t i = start; static_cast<int>(i) < units; i += stride, ++k) {
+                if (k % nsub != sub) {
+                    continue;      // the other subblock on this core takes it
+                }
                 TileSpan span;
                 ResolveTile(params, static_cast<int>(i) / params.H, span);
                 if (span.valid) {
@@ -234,7 +251,11 @@ public:
             Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
 
             Catlass::Arch::CrossCoreWaitFlag(aicReady);
-            for (uint32_t i = start; static_cast<int>(i) < units; i += stride) {
+            k = 0;
+            for (uint32_t i = start; static_cast<int>(i) < units; i += stride, ++k) {
+                if (k % nsub != sub) {
+                    continue;
+                }
                 TileSpan span;
                 ResolveTile(params, static_cast<int>(i) / params.H, span);
                 if (span.valid) {
