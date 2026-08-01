@@ -1072,7 +1072,9 @@ private:
         // s4 = k_dec @ state, the delta-rule prediction to subtract from v.
         Gemm(bufs, params, kdec, state, Slot(params, tileIdx, headIdx, 4), CHUNK, D, D, false);
         // s6 = q_dec @ state, the first half of out.
-        Gemm(bufs, params, qdec, state, Slot(params, tileIdx, headIdx, 6), CHUNK, D, D, false);
+        // Same state as operand B, already in L1 from the call above.
+        Gemm(bufs, params, qdec, state, Slot(params, tileIdx, headIdx, 6), CHUNK, D, D, false,
+             /*loadB=*/false);
         (void)seqIdx;
         (void)mqk;
         (void)inv;
@@ -1100,8 +1102,15 @@ private:
 
     // C[m,n] = A[m,k] @ B[k,n], all operands bf16 in GM scratch.
     CATLASS_DEVICE
+    // loadB=false reuses whatever is already in the L1 B slot.
+    //
+    // PreGemms runs k_dec @ state and q_dec @ state back to back with the same
+    // state as operand B, and each call reloaded all 32 KB of it. The cube is
+    // memory-bound here -- aic_mte2_ratio 0.244 against aic_mac_ratio 0.02, so
+    // it is fetching operands rather than computing -- and the state is the
+    // bulk of what it fetches.
     void Gemm(K2AicBufs& bufs, Params const& params, int64_t aByte, int64_t bByte, int64_t cByte,
-              int m, int n, int k, bool bf16Out)
+              int m, int n, int k, bool bf16Out, bool loadB = true)
     {
         AscendC::GlobalTensor<BF16> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
@@ -1116,7 +1125,9 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
 
         LoadNd2Nz(bufs, l1A, gm, aByte, m, k);   // A: RowMajor -> zN, feeds L0A
-        LoadBGmToL1zZ(l1B, gm, bByte, k, n);     // B: RowMajor -> zZ, feeds L0B
+        if (loadB) {
+            LoadBGmToL1zZ(l1B, gm, bByte, k, n); // B: RowMajor -> zZ, feeds L0B
+        }
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)0);
