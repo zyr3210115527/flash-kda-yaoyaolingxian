@@ -37,6 +37,16 @@ namespace flash_kda {
 // ============================================================
 
 constexpr int CHUNK = 16;
+
+// log2(CHUNK), for the Neumann series length: inverting (I + L) for a strictly
+// lower triangular CHUNK x CHUNK L needs log2(CHUNK) doubling factors, since
+// L^CHUNK = 0.
+//
+// A value rather than a constexpr function -- a constexpr free function in this
+// header is not visible to device code on this toolchain.
+constexpr int kLog2Chunk = (CHUNK == 16) ? 4 : (CHUNK == 32) ? 5 : (CHUNK == 64) ? 6 : 0;
+static_assert(kLog2Chunk != 0, "CHUNK must be 16, 32 or 64");
+static_assert(CHUNK % 16 == 0, "CHUNK must be a multiple of the 16x16 fractal");
 constexpr int D = 128;  // K = V = 128
 
 // Ascend architecture tag. CATLASS_ARCH selects the SoC generation:

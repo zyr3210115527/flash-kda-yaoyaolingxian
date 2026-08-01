@@ -120,7 +120,10 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
         cu_seqlens = torch.arange(0, B * T_seq + 1, T_seq, dtype=torch.long, device=q.device)
 
     _, H, D = q.shape
-    CHUNK = 16
+    # From the extension, so this oracle cannot silently disagree with the
+    # kernel about chunk size.
+    from flash_kda import _C as _kda_C
+    CHUNK = _kda_C.CHUNK
     device = q.device
     scale_bf16 = torch.tensor(scale, dtype=torch.bfloat16, device=device)
 
@@ -207,15 +210,20 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
                 Mqk = torch.tril(Mqk)
 
                 # Neumann inverse: INV = (I-L)^{-1}
-                # = (I-L) + (I-L)@L^2 + (I-L)@L^2@L^4 + (I-L)@L^2@L^4@L^8
-                # Simplified: INV = (I-L) + INV@L^2, INV += INV@L^4, INV += INV@L^8
+                #   = (I-L)(I+L^2)(I+L^4)...(I+L^(CHUNK/2))
+                # L is strictly lower triangular and CHUNK x CHUNK, so
+                # L^CHUNK = 0 and the series terminates. Each factor doubles the
+                # reach, so the count is log2(CHUNK) - 1 after the leading
+                # (I - L): three at CHUNK=16, four at 32, five at 64.
+                #
+                # This was written out for CHUNK=16. Deriving it is what lets the
+                # kernel's CHUNK change and still be checked against this.
                 INV = torch.eye(CHUNK, dtype=torch.float16, device=device) - L
-                L2 = matmul_fp16acc(L, L)
-                INV = INV + matmul_fp16acc(INV, L2)
-                L4 = matmul_fp16acc(L2, L2)
-                INV = INV + matmul_fp16acc(INV, L4)
-                L8 = matmul_fp16acc(L4, L4)
-                INV = INV + matmul_fp16acc(INV, L8)
+                Lp = matmul_fp16acc(L, L)                  # L^2
+                n_factors = CHUNK.bit_length() - 2         # log2(CHUNK) - 1
+                for _ in range(n_factors):
+                    INV = INV + matmul_fp16acc(INV, Lp)
+                    Lp = matmul_fp16acc(Lp, Lp)
                 INV = INV.to(torch.bfloat16)
 
                 # Recurrence

@@ -49,8 +49,17 @@ struct K2Ub {
     static constexpr uint32_t kBeta   = kGTotal + D * 4;         // [16] f32
     static constexpr uint32_t kStateA = kBeta + 2048;              // [128,128] f32 row block
     static constexpr uint32_t kStateB = kStateA + D * D * 4;
-    static constexpr uint32_t kNarrow = kStateB + D * D * 4;  // [D,D] bf16
-    static constexpr uint32_t kScalar = kNarrow + D * D * 2;
+    // [D,D] bf16 staging for StateUbToGmT, which runs only when writing the
+    // final state -- after the chunk loop, when kV/kU/kF32A/kF32B are dead.
+    //
+    // Overlaying it on those keeps kernel2 inside the 192 KB UB at larger
+    // CHUNK, where a separate D*D*2 allocation does not fit. The front region
+    // is only big enough from CHUNK=32 up, so at 16 it keeps its own space.
+    static constexpr uint32_t kFront  = CHUNK * D * 2 * 2 + CHUNK * D * 4 * 2;
+    static constexpr bool kNarrowFits = kFront >= D * D * 2;
+    static constexpr uint32_t kNarrow = kNarrowFits ? kV : (kStateB + D * D * 4);
+    static constexpr uint32_t kScalar =
+        kNarrowFits ? (kStateB + D * D * 4) : (kStateB + D * D * 4 + D * D * 2);
     static constexpr uint32_t kEnd    = kScalar + 256;
 };
 static_assert(K2Ub::kEnd < ArchTag::UB_SIZE, "kernel2 UB budget exceeded");
@@ -909,7 +918,11 @@ private:
     void StateToBf16Resident(K2AivBufs& bufs, Params const& params, int tileIdx,
                              int headIdx, AscendC::LocalTensor<float> sf)
     {
-        auto sb = bufs.template Ub<BF16>(K2Ub::kNarrow);
+        // kStateB, not kNarrow: kNarrow now overlays the front buffers, which
+        // are live mid-loop. kStateB holds DecayState's `upd`, dead by here,
+        // and this is the same buffer StateToBf16 uses for the same purpose.
+        // sf is kStateA, so there is no aliasing with the source.
+        auto sb = bufs.template Ub<BF16>(K2Ub::kStateB);
         AscendC::GlobalTensor<BF16> wsB;
         wsB.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
 

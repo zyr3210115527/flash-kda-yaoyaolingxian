@@ -65,19 +65,19 @@ struct K1Ub {
     static constexpr uint32_t kLf     = kKRes + CHUNK * D * 2;
     static constexpr uint32_t kMqkF   = kLf + CHUNK * CHUNK * 4;
     static constexpr uint32_t kSmallA = kMqkF + CHUNK * CHUNK * 4;
-    static constexpr uint32_t kSmallB = kSmallA + 512;
-    static constexpr uint32_t kReduce = kSmallB + 512;
+    static constexpr uint32_t kSmallB = kSmallA + CHUNK * CHUNK * 2;
+    static constexpr uint32_t kReduce = kSmallB + CHUNK * CHUNK * 2;
     static constexpr uint32_t kScalar = kReduce + 1024;   // 32 sums at 8-float stride, then scratch
     // Mask tiles for MaskAndBuild. Each is 16x16 fp32 = 1024 B; kColNeg holds
     // only 16 floats but keeps the full slot so every base stays 32-byte
     // aligned.
     static constexpr uint32_t kColNeg = kScalar + 2048;
     static constexpr uint32_t kDiff   = kColNeg + 1024;
-    static constexpr uint32_t kMaskL  = kDiff + 1024;
-    static constexpr uint32_t kMaskLE = kMaskL + 1024;
+    static constexpr uint32_t kMaskL  = kDiff + CHUNK * CHUNK * 4;
+    static constexpr uint32_t kMaskLE = kMaskL + CHUNK * CHUNK * 4;
     // A [CHUNK, D] fp32 scratch tile, for whole-tile decay and for broadcasting
     // per-column vectors like dt_bias and g_total across rows.
-    static constexpr uint32_t kTile   = kMaskLE + 1024;
+    static constexpr uint32_t kTile   = kMaskLE + CHUNK * CHUNK * 4;
     static constexpr uint32_t kEnd    = kTile + CHUNK * D * 4;
 };
 static_assert(K1Ub::kEnd < ArchTag::UB_SIZE, "kernel1 UB budget exceeded");
@@ -94,12 +94,12 @@ struct K1L1 {
     // Neumann chain intermediates, kept in L1 so the six gemms never round trip
     // through GM. Five 16x16 bf16 tiles: L^2/L^4/L^8 ping-ponging between two,
     // and the running product between two more, plus the identity.
-    static constexpr uint32_t kNeuA   = kSmallC + 512;
-    static constexpr uint32_t kNeuB   = kNeuA + 512;
-    static constexpr uint32_t kNeuPA  = kNeuB + 512;
-    static constexpr uint32_t kNeuPB  = kNeuPA + 512;
-    static constexpr uint32_t kNeuI   = kNeuPB + 512;
-    static constexpr uint32_t kEnd    = kNeuI + 512;
+    static constexpr uint32_t kNeuA   = kSmallC + CHUNK * CHUNK * 2;
+    static constexpr uint32_t kNeuB   = kNeuA + CHUNK * CHUNK * 2;
+    static constexpr uint32_t kNeuPA  = kNeuB + CHUNK * CHUNK * 2;
+    static constexpr uint32_t kNeuPB  = kNeuPA + CHUNK * CHUNK * 2;
+    static constexpr uint32_t kNeuI   = kNeuPB + CHUNK * CHUNK * 2;
+    static constexpr uint32_t kEnd    = kNeuI + CHUNK * CHUNK * 2;
 };
 static_assert(K1L1::kEnd < ArchTag::L1_SIZE, "kernel1 L1 budget exceeded");
 
@@ -1188,7 +1188,9 @@ private:
 
         AscendC::LoadData2DParams ld;
         ld.startIndex = 0;
-        ld.repeatTimes = 1;
+        // A CHUNK x CHUNK bf16 tile is (CHUNK/16)^2 fractals, not one. This was
+        // written when CHUNK was 16 and the two happened to coincide.
+        ld.repeatTimes = (CHUNK / C0_NUM_PER_FRACTAL) * (CHUNK / C0_NUM_PER_FRACTAL);
         ld.srcStride = 1;
         ld.dstGap = 0;
         ld.ifTranspose = false;
@@ -1261,7 +1263,9 @@ private:
 
         AscendC::LoadData2DParams ld;
         ld.startIndex = 0;
-        ld.repeatTimes = 1;
+        // A CHUNK x CHUNK bf16 tile is (CHUNK/16)^2 fractals, not one. This was
+        // written when CHUNK was 16 and the two happened to coincide.
+        ld.repeatTimes = (CHUNK / C0_NUM_PER_FRACTAL) * (CHUNK / C0_NUM_PER_FRACTAL);
         ld.srcStride = 1;
         ld.dstGap = 0;
         ld.ifTranspose = false;
@@ -1311,7 +1315,9 @@ private:
 
         AscendC::LoadData2DParams ld;
         ld.startIndex = 0;
-        ld.repeatTimes = 1;
+        // A CHUNK x CHUNK bf16 tile is (CHUNK/16)^2 fractals, not one. This was
+        // written when CHUNK was 16 and the two happened to coincide.
+        ld.repeatTimes = (CHUNK / C0_NUM_PER_FRACTAL) * (CHUNK / C0_NUM_PER_FRACTAL);
         ld.srcStride = 1;
         ld.dstGap = 0;
         ld.ifTranspose = false;
@@ -1387,17 +1393,36 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
 
-        // (I + L)^-1 = (I - L)(I + L^2)(I + L^4)(I + L^8).
-        // L powers ping-pong kNeuA/kNeuB, the product kNeuPA/kNeuPB.
-        Gemm16L1(bufs, K1L1::kNeuA, K1L1::kNeuA, K1L1::kNeuB);                    // L^2
-        Gemm16FusedL1(bufs, K1L1::kNeuPA, K1L1::kNeuI, K1L1::kNeuB, K1L1::kNeuPB);
-        Gemm16L1(bufs, K1L1::kNeuB, K1L1::kNeuB, K1L1::kNeuA);                    // L^4
-        Gemm16FusedL1(bufs, K1L1::kNeuPB, K1L1::kNeuI, K1L1::kNeuA, K1L1::kNeuPA);
-        Gemm16L1(bufs, K1L1::kNeuA, K1L1::kNeuA, K1L1::kNeuB);                    // L^8
+        // (I + L)^-1 = (I - L)(I + L^2)(I + L^4)(I + L^8)...(I + L^(CHUNK/2)).
+        //
+        // L is strictly lower triangular and CHUNK x CHUNK, so L^CHUNK = 0 and
+        // the series terminates. Each factor doubles the reach, so the count is
+        // log2(CHUNK): four factors at CHUNK=16, five at 32, six at 64. It was
+        // written out for 16; deriving it is what lets CHUNK change.
+        //
+        // L powers ping-pong kNeuA/kNeuB, the running product kNeuPA/kNeuPB.
+        // kNumNeumann counts the (I + L^k) factors after the leading (I - L).
+        constexpr int kNumNeumann = kLog2Chunk - 1;
 
-        // Last factor goes to GM, where kernel2 reads it.
-        Gemm16FusedFromL1ToGm(bufs, params, K1L1::kNeuPA, K1L1::kNeuI, K1L1::kNeuB,
-                              Ws(span, headIdx, WorkspaceOffsets::kINV));
+        uint32_t lSrc = K1L1::kNeuA;      // holds L^(2^j)
+        uint32_t lDst = K1L1::kNeuB;
+        uint32_t pSrc = K1L1::kNeuPA;     // holds the running product
+        uint32_t pDst = K1L1::kNeuPB;
+
+        for (int j = 0; j < kNumNeumann; ++j) {
+            // lDst = lSrc^2, i.e. L^(2^(j+1))
+            Gemm16L1(bufs, lSrc, lSrc, lDst);
+
+            if (j == kNumNeumann - 1) {
+                // Last factor: straight to GM, where kernel2 reads it.
+                Gemm16FusedFromL1ToGm(bufs, params, pSrc, K1L1::kNeuI, lDst,
+                                      Ws(span, headIdx, WorkspaceOffsets::kINV));
+            } else {
+                Gemm16FusedL1(bufs, pSrc, K1L1::kNeuI, lDst, pDst);
+                uint32_t t = pSrc; pSrc = pDst; pDst = t;
+            }
+            uint32_t t = lSrc; lSrc = lDst; lDst = t;
+        }
     }
 
     // Final step of the L1 chain: operands in L1, result to GM.
@@ -1411,7 +1436,9 @@ private:
 
         AscendC::LoadData2DParams ld;
         ld.startIndex = 0;
-        ld.repeatTimes = 1;
+        // A CHUNK x CHUNK bf16 tile is (CHUNK/16)^2 fractals, not one. This was
+        // written when CHUNK was 16 and the two happened to coincide.
+        ld.repeatTimes = (CHUNK / C0_NUM_PER_FRACTAL) * (CHUNK / C0_NUM_PER_FRACTAL);
         ld.srcStride = 1;
         ld.dstGap = 0;
         ld.ifTranspose = false;
@@ -1519,7 +1546,9 @@ private:
 
         AscendC::LoadData2DParams ld;
         ld.startIndex = 0;
-        ld.repeatTimes = 1;
+        // A CHUNK x CHUNK bf16 tile is (CHUNK/16)^2 fractals, not one. This was
+        // written when CHUNK was 16 and the two happened to coincide.
+        ld.repeatTimes = (CHUNK / C0_NUM_PER_FRACTAL) * (CHUNK / C0_NUM_PER_FRACTAL);
         ld.srcStride = 1;
         ld.dstGap = 0;
         ld.ifTranspose = false;

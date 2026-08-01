@@ -273,6 +273,19 @@ int64_t sync_onearg(int64_t n, int64_t h) {
 }
 
 PYBIND11_MODULE(_C, m) {
+    // Tests and benchmarks read the chunk size from here rather than
+    // hardcoding it. A dozen files had their own `CHUNK = 16`, which is exactly
+    // how a test silently stops matching the kernel it is checking.
+    m.attr("CHUNK") = flash_kda::CHUNK;
+    // The probes index the workspace by byte offset. Those offsets move with
+    // CHUNK, so they come from here rather than being copied into each test.
+    m.attr("WS_PER_TILE") = int64_t(flash_kda::WorkspaceSizes::kPerTile);
+    m.attr("WS_OFF_KINV") = int(flash_kda::WorkspaceOffsets::kINV);
+    m.attr("WS_OFF_KMQK") = int(flash_kda::WorkspaceOffsets::kMqk);
+    m.attr("WS_OFF_SCRATCH") = int(flash_kda::WorkspaceOffsets::kScratch);
+    m.attr("WS_OFF_KGTOTAL") = int(flash_kda::WorkspaceOffsets::kGTotal);
+    m.attr("WS_OFF_IDENTITY") = int(flash_kda::WorkspaceOffsets::kIdentity);
+
     m.def("sync_onearg", &sync_onearg, "single-argument cross-core handshake probe",
           py::arg("n"), py::arg("h"));
     m.def("aic_only", &aic_only, "AIC-only probe", py::arg("flag"));

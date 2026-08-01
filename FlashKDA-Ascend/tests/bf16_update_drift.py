@@ -21,6 +21,11 @@ import math, os, sys, torch
 sys.path.insert(0, os.getcwd()); sys.path.insert(0, os.path.join(os.getcwd(), "tests"))
 import torch_npu  # noqa
 
+# Chunk size comes from the extension, not a local constant: a test that
+# hardcodes it silently stops matching the kernel when the kernel changes.
+from flash_kda import _C as _kda_C
+CHUNK = _kda_C.CHUNK
+
 DEV = torch.device("npu:0"); D = 128; CHUNK = 16
 
 def run(T, H, seed=0):
