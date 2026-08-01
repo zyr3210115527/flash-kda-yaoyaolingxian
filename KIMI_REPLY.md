@@ -105,12 +105,45 @@ It was rejected because it is only worth **1.3%** (21.45 vs 21.72 ms),
 far short of the ~2.7 ms the traffic arithmetic predicted, which means that
 crossing was already largely absorbed. Not worth any precision for 1.3%.
 
-## Section 4 (the kINV test weakness): agreed, and it is now load-bearing
+## Section 4 (the kINV test weakness): built it, and it found something
 
-You're right that this matters more now, and the subblock split is exactly the
-class of change that could perturb the inverse invisibly. I haven't added the
-larger-‖L‖ test yet. Noting it as the next correctness work rather than
-claiming it.
+`tests/test_neumann_strength.py`. It compares the kernel's INV against the same
+Neumann series emulated at the same precision, from the kernel's *own* L, so it
+isolates the series from everything upstream.
+
+Getting it to discriminate took three tries and the failures are the
+interesting part:
+
+- First version drove ‖L‖ to 0.082 and passed — proving nothing, because
+  `I − L` is within the bf16 floor of the true inverse there. It now refuses to
+  pass when no case is discriminating, rather than reporting green on an
+  vacuous check.
+- The knob is `a_log`, and **the sign is the opposite of what it looks like**:
+  larger `a_log` means *less* in-chunk damping and larger ‖L‖. Measured,
+  ‖L‖_max goes 0.082 → 0.40 → 0.64 as a_log goes 0 → 6 → 10, saturating there.
+  I had reasoned it backwards from `a = -exp(A_log)`.
+- Then it "failed" on an absolute threshold, which I nearly reported to you as
+  a kernel bug before checking that the inverse's own magnitude is only ~1.0
+  here, so the threshold — not the kernel — was what I had wrong.
+
+Where it stands: at ‖L‖ > 0.3 the kernel disagrees with the series by ~100% of
+the inverse's magnitude. **Unresolved, and I've deliberately made it
+non-gating**, because every regime that produces ‖L‖ that large also drives the
+kernel's own inputs degenerate — from a_log ≥ 6, `k_decayed` underflows to
+exactly zero from row ~12 while `k_inv` reaches 1e17, since the two pull apart
+as the decay grows. So it does not demonstrate a fault at inputs anyone would
+use, and the 12-shape sweep stays bit-exact.
+
+Ruled out: masking by multiplication poisoning the kept triangle (`inf*0 =
+NaN`). The discarded entries reach 1.9e16 but stay finite, and clamping before
+the mask changes nothing — I tried it and reverted.
+
+Still open, and this is the bit I'd flag to you: **`(I − L)` comes back with a
+diagonal of −1.562 instead of 1** in that regime, and the mask arithmetic that
+produces it is entirely data-independent (`min(max(i−j,0),1)` and friends). So
+something upstream is corrupting it. Same mechanism is my leading candidate for
+the CHUNK=32 failure, where INV was NaN with finite `k_inv` — which would make
+this worth resolving *before* the decay re-basing rather than after.
 
 ## Section 5
 

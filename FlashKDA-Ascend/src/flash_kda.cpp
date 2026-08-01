@@ -288,6 +288,16 @@ PYBIND11_MODULE(_C, m) {
     m.attr("WS_OFF_SCRATCH") = int(flash_kda::WorkspaceOffsets::kScratch);
     m.attr("WS_OFF_KGTOTAL") = int(flash_kda::WorkspaceOffsets::kGTotal);
     m.attr("WS_OFF_IDENTITY") = int(flash_kda::WorkspaceOffsets::kIdentity);
+    // Scratch slot byte offsets, so probes do not re-derive the wide/narrow
+    // slot mapping (which moved once already when the workspace shrank).
+    {
+        py::list slots;
+        for (int i = 0; i < flash_kda::WorkspaceSizes::kNumScratch; ++i) {
+            slots.append(int(flash_kda::WorkspaceOffsets::kScratch) +
+                         flash_kda::WorkspaceSizes::SlotOffset(i));
+        }
+        m.attr("WS_SLOT_OFF") = slots;
+    }
 
     m.def("sync_onearg", &sync_onearg, "single-argument cross-core handshake probe",
           py::arg("n"), py::arg("h"), py::arg("iters") = 8);
