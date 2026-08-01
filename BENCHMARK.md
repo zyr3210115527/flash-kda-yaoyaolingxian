@@ -35,8 +35,8 @@ zeros and copied it, and ~20 GB does not go through the host:
 
 | T | H | workspace | ours ms | CUDA/H20 ms | ratio |
 |---:|---:|---:|---:|---:|---:|
-| 8192 | 64 | 6.3 G | 45.49 | 1.6217 | **28×** |
-| 8192 | 96 | 9.5 G | 62.18 | 2.6220 | **24×** |
+| 8192 | 64 | 6.3 G | 43.94 | 1.6217 | **27×** |
+| 8192 | 96 | 9.5 G | 59.88 | 2.6220 | **23×** |
 
 Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
 about 0.180 from H=64 onward, so this is a stable figure rather than one that
@@ -170,19 +170,52 @@ Two intermittent faults in this work were hidden by running a check once:
 `tests/race_probe.py` and `tests/race_fields.py` need several runs to mean
 anything. A clean single run is not evidence.
 
+## Where it stands, and the ceiling
+
+At T=4096 H=64: kernel1 8.47 ms, kernel2 13.2 ms, 21.70 ms total. Both are
+single fused kernels now, so all of that is real work rather than dispatch.
+
+The pipeline does 30.9 GFLOP at this shape, so 21.70 ms is **1.42 TFLOP/s
+against the 910B3's ~376 TFLOP/s bf16 peak — 0.38%.**
+
+That number is the whole story of what is left. It is not a tuning gap; it is
+structural. Every matmul in the algorithm has m=16, one fractal row, because
+CHUNK=16:
+
+    kernel1   [16,128]x[128,16] twice, then six 16x16x16
+    kernel2   [16,128]x[128,128] twice, [16,16]x[16,128] twice,
+              [128,16]x[16,128] once
+
+The cube reaches peak on bulk 16x16x16 fractals, and this issues them one row
+at a time with a full operand-load and drain around each. Latency-bound by
+construction.
+
 ## What to do next
 
-1. **Kernel1 is now the larger half** (~16 ms of 30 at T=4096 H=64). It has had
-   the launch and barrier work; what is left is the actual vector and cube work
-   per tile.
-2. **Kernel2's gemms are M=16.** `[16,128] × [128,128]` uses one row of
-   fractals per MMAD. Heads are independent and 64 of them share a chunk index,
-   so batching across heads is possible; the state recurrence is what cannot
-   batch.
-3. **Raise CHUNK from 16.** Fewer, larger chunks: 16 is the cube's minimum
-   fractal. Large change — masks, buffer sizes, two more Neumann factors.
-4. **Move FinishOut to the cube** (task #15). Now much less attractive: it saved
-   launches, and launches are no longer the bottleneck.
+1. **Raise CHUNK.** The only change that lifts the 0.38% ceiling, because it is
+   the only one that makes the gemms bigger. CHUNK=64 would give each matmul 4x
+   the m dimension and cut tile count 4x.
+
+   It is a real refactor, not a constant change. The code is largely
+   CHUNK-parameterized already, but the Neumann series is not: it uses exactly
+   four factors, `(I-L)(I+L^2)(I+L^4)(I+L^8)`, which terminates only because L
+   is strictly lower triangular and 16x16, so L^16 = 0. CHUNK=32 needs five
+   factors, CHUNK=64 needs six. Mask construction, buffer sizes, and the L1
+   Neumann slots all follow from that.
+
+   It also changes what "correct" means: the CUDA reference and `torch_ref.py`
+   both use CHUNK=16 and reproduce its rounding step by step, so a different
+   chunk size cannot be validated against them directly. That needs settling
+   first -- probably by keeping CHUNK=16 as the validated path and treating a
+   larger chunk as a separate configuration with its own oracle.
+
+2. **PostGemms' three gemms** (3.6 ms) chain through GM via `uu`. The L1 trick
+   that worked for Neumann does not transfer: `uu` is `[16,128]` and feeds a B
+   operand in zZ layout, while Fixpipe writes row-major. Neumann only worked
+   because a 16x16 tile is a single fractal where the two layouts coincide.
+
+3. **Prepare's loads** (0.74 ms) and **Decay** (0.66 ms) are what remain in
+   kernel1 after NormalizeAll. Small, and both are already whole-tile.
 
 ## A note on the numbers above
 
