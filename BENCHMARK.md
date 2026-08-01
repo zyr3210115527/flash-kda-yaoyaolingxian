@@ -35,8 +35,8 @@ zeros and copied it, and ~20 GB does not go through the host:
 
 | T | H | workspace | ours ms | CUDA/H20 ms | ratio |
 |---:|---:|---:|---:|---:|---:|
-| 8192 | 64 | 6.3 G | 43.84 | 1.6217 | **27×** |
-| 8192 | 96 | 9.5 G | 59.69 | 2.6220 | **23×** |
+| 8192 | 64 | 6.3 G | 33.33 | 1.6217 | **21×** |
+| 8192 | 96 | 9.5 G | 45.64 | 2.6220 | **17×** |
 
 Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
 about 0.180 from H=64 onward, so this is a stable figure rather than one that
@@ -214,41 +214,29 @@ restructured).
 
 ## What to do next
 
-Ordered by what the counters say is actually there, not by ease.
+1. **Split the remaining vector phases across subblocks.** `BuildU`,
+   `FinishOut` and `StoreOut` still run on subblock 0 only — 2.6 ms of kernel2
+   between them. The mechanism is proven now; this is bookkeeping.
 
-1. **Overlap AIC and AIV.** The single biggest item. They alternate rather than
-   overlap — kernel2 at T=4096 H=64 spends 4.78 ms of AIC pipe time and 6.65 ms
-   of AIV time in a 13.2 ms kernel, i.e. their sum. Perfect overlap would put
-   kernel2 near 6.6 ms.
+2. **Skew the pipeline so AIC and AIV overlap.** They still alternate: kernel2
+   is AIC-pipe-time plus AIV-time. The subblock split shortened the AIV half
+   but did not overlap the two. Kimi's suggestion is the cheap route —
+   `PreGemms(c+1)` reads only the bf16 state copy, which `StateToBf16` produces
+   before `DecayState(c)`, so the cube can start c+1 while the vector unit is
+   still finishing c, with no second fp32 state and no UB pressure.
 
-   Two routes, both blocked for now:
-   - *Use the second vector core* (A2 is 1 cube : 2 vector, and declaring
-     `MIX_AIC_1_1` halves what the runtime hands out). Six attempts, all in
-     `docs/debugging-notes.md`. The sync rule found — `CrossCoreSetFlag<0x2>`
-     needs every AIV in the group to set — is correct in an isolated probe but
-     the same pattern gives NaN in the real kernel. Needs the actual 1:2 flag
-     protocol, i.e. a documentation source rather than more probing.
-   - *Two independent (sequence, head) units per block*, so the cube works on
-     one while the vector unit works on the other. Blocked on UB: two resident
-     states is 128 KB of 192 KB.
+3. **INV's diagonal violates a structural invariant at ‖L‖ > 0.3**
+   (`tests/test_neumann_strength.py`). Not reproducible at usable inputs, but
+   it is the leading candidate for the CHUNK=32 failure, so it is worth
+   resolving *before* the decay re-basing rather than after.
 
-2. **Raise CHUNK**, which is what lifts the cube off 2–3% MAC utilization. Two
-   things in the way, both now understood (see `docs/debugging-notes.md`):
-   the decay representation overflows fp32 past CHUNK=16 at lower_bound=−5, so
-   it needs re-basing within the chunk; and a 16×16-specific stride remains in
-   the Gemm16 family. Re-basing around the chunk midpoint buys exactly one
-   doubling — enough for CHUNK=32.
+4. **Raise CHUNK**, which is what lifts the cube off 2–3% MAC utilization.
+   Needs the decay re-based within the chunk (fp32 range, measured) and the
+   remaining 16×16-specific stride in the Gemm16 family.
 
-3. **The scalar unit** is ~31% of vector-core time in both kernels, more than
-   the vector unit itself in kernel2. Moving individual operations does not
-   help (tried, `Rsqrt`: correct but slower, because getting values to the
-   vector unit and back costs more than the scalar op saved). It needs a
-   restructuring that stops crossing the scalar/vector boundary at all.
-
-4. **Double-buffer the AIC's L1 loads.** `aic_mte2_ratio` is 0.24 and L1 has
-   ~496 KB spare, so the next unit's operands could be prefetched during the
-   current one's Mmad. Modest — bounded by the AIC half of an alternating
-   kernel.
+5. **The scalar unit** is ~31% of vector-core time. Moving individual
+   operations does not help (measured: `Rsqrt` is correct but slower); it needs
+   a restructuring that stops crossing the scalar/vector boundary.
 
 ## A note on the numbers above
 
