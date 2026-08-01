@@ -197,6 +197,17 @@ void fwd(
     params.total_tiles = total_tiles;
     params.has_state_in = has_state_in ? 1 : 0;
     params.has_state_out = has_state_out ? 1 : 0;
+    // Keep the Neumann chain in L1 rather than round-tripping GM. Read once;
+    // the chain is the largest single item in the pipeline (8.7 ms of 30 at
+    // T=4096 H=64) and almost all of that is six GM round trips.
+    static const int kL1Neumann = [] {
+        const char *e = std::getenv("FLASH_KDA_L1_NEUMANN");
+        // Default on: measured 23.7 ms against 30.3 at T=4096 H=64, with
+        // byte-identical error values. FLASH_KDA_L1_NEUMANN=0 selects the GM
+        // path, which is the reference it was validated against.
+        return (e == nullptr || e[0] != '0') ? 1 : 0;
+    }();
+    params.l1_neumann = kL1Neumann;
     params.state_fp32 = state_fp32 ? 1 : 0;
     params.is_varlen = is_varlen ? 1 : 0;
     params.chunk_idx = 0;

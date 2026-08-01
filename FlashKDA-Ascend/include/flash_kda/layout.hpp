@@ -228,6 +228,10 @@ struct FwdParams {
     // Feature flags (runtime, not template specialization)
     int has_state_in;
     int has_state_out;
+
+    // Keep the Neumann chain's intermediates in L1 instead of round-tripping
+    // them through GM. Set from FLASH_KDA_L1_NEUMANN.
+    int l1_neumann;
     int state_fp32;
     int is_varlen;
 };

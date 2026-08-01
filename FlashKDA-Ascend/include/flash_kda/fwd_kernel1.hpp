@@ -91,7 +91,15 @@ struct K1L1 {
     // Second B operand for Gemm16Fused. A 16x16 bf16 tile is 512 bytes and L1
     // is 512 KB, so this costs nothing worth counting.
     static constexpr uint32_t kSmallC = kSmallB + 512;
-    static constexpr uint32_t kEnd    = kSmallC + 512;
+    // Neumann chain intermediates, kept in L1 so the six gemms never round trip
+    // through GM. Five 16x16 bf16 tiles: L^2/L^4/L^8 ping-ponging between two,
+    // and the running product between two more, plus the identity.
+    static constexpr uint32_t kNeuA   = kSmallC + 512;
+    static constexpr uint32_t kNeuB   = kNeuA + 512;
+    static constexpr uint32_t kNeuPA  = kNeuB + 512;
+    static constexpr uint32_t kNeuPB  = kNeuPA + 512;
+    static constexpr uint32_t kNeuI   = kNeuPB + 512;
+    static constexpr uint32_t kEnd    = kNeuI + 512;
 };
 static_assert(K1L1::kEnd < ArchTag::L1_SIZE, "kernel1 L1 budget exceeded");
 
@@ -255,7 +263,11 @@ public:
                 TileSpan span;
                 ResolveTile(params, static_cast<int>(i) / params.H, span);
                 if (span.valid) {
+                    if (params.l1_neumann != 0) {
+                    ComputeNeumannL1(bufs, params, static_cast<int>(i) % params.H, span);
+                } else {
                     ComputeNeumann(bufs, params, static_cast<int>(i) % params.H, span);
+                }
                 }
             }
         }
@@ -384,7 +396,11 @@ public:
             TileSpan span;
             ResolveTile(params, static_cast<int>(coreIdx) / params.H, span);
             if (span.valid) {
+                if (params.l1_neumann != 0) {
+                ComputeNeumannL1(bufs, params, headIdx, span);
+            } else {
                 ComputeNeumann(bufs, params, headIdx, span);
+            }
             }
             // Units share one TPipe, so the pipelines are not drained between
             // them the way a launch boundary would. Each phase was written
@@ -1156,6 +1172,222 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)1);
 
         // The next call reloads L1 from the GM this Fixpipe just wrote.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+    }
+
+    // One 16x16 gemm whose operands and result all live in L1.
+    //
+    // The GM-based Gemm16 writes its result out through Fixpipe and the next
+    // call reads it back, which for a chain of six is six round trips and six
+    // FIX_MTE2 waits to move 512 bytes at a time. Everything in the Neumann
+    // chain is private to this core, so Fixpipe can target L1 directly --
+    // dav_c220 implements FixpipeL0C2L1Impl -- and the next LoadData reads it
+    // without memory ever being involved.
+    CATLASS_DEVICE
+    void Gemm16L1(K1AicBufs& bufs, uint32_t aL1, uint32_t bL1, uint32_t dstL1)
+    {
+        auto l0A = bufs.template L0A<BF16>();
+        auto l0B = bufs.template L0B<BF16>();
+        auto l0C = bufs.template L0C<float>();
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = 1;
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = false;
+        AscendC::LoadData(l0A, bufs.template L1<BF16>(aL1), ld);
+        AscendC::LoadData(l0B, bufs.template L1<BF16>(bL1), ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        AscendC::MmadParams mp;
+        mp.m = CHUNK;
+        mp.n = CHUNK;
+        mp.k = CHUNK;
+        mp.cmatrixInitVal = true;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+
+        AscendC::FixpipeParamsV220 fp;
+        fp.nSize = CHUNK;
+        fp.mSize = CHUNK;
+        fp.srcStride = CHUNK;
+        fp.dstStride = CHUNK;
+        fp.quantPre = QuantMode_t::F322BF16;
+        AscendC::Fixpipe<BF16, float, AscendC::CFG_ROW_MAJOR>(
+            bufs.template L1<BF16>(dstL1), l0C, fp);
+
+        // The next LoadData reads what this just wrote, but from L1 rather than
+        // GM, so this is FIX_MTE1 and not the FIX_MTE2 the GM version needs.
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE1>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE1>((event_t)1);
+    }
+
+    // dst = A*B1 + A*B2, all in L1. The L1 counterpart of Gemm16Fused: each
+    // Neumann factor is P*(I + L^k) = P*I + P*L^k, two Mmads accumulating into
+    // one L0C with a single Fixpipe.
+    CATLASS_DEVICE
+    void Gemm16FusedL1(K1AicBufs& bufs, uint32_t aL1, uint32_t b1L1, uint32_t b2L1,
+                       uint32_t dstL1)
+    {
+        auto l0A = bufs.template L0A<BF16>();
+        auto l0B = bufs.template L0B<BF16>();
+        auto l0C = bufs.template L0C<float>();
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = 1;
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = false;
+        AscendC::LoadData(l0A, bufs.template L1<BF16>(aL1), ld);
+        AscendC::LoadData(l0B, bufs.template L1<BF16>(b1L1), ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        AscendC::MmadParams mp;
+        mp.m = CHUNK;
+        mp.n = CHUNK;
+        mp.k = CHUNK;
+        mp.cmatrixInitVal = true;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+
+        AscendC::LoadData(l0B, bufs.template L1<BF16>(b2L1), ld);   // A stays in L0A
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        mp.cmatrixInitVal = false;      // accumulate onto A*B1
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+
+        AscendC::FixpipeParamsV220 fp;
+        fp.nSize = CHUNK;
+        fp.mSize = CHUNK;
+        fp.srcStride = CHUNK;
+        fp.dstStride = CHUNK;
+        fp.quantPre = QuantMode_t::F322BF16;
+        AscendC::Fixpipe<BF16, float, AscendC::CFG_ROW_MAJOR>(
+            bufs.template L1<BF16>(dstL1), l0C, fp);
+
+        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE1>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE1>((event_t)1);
+    }
+
+    // The Neumann series with every intermediate in L1. GM is touched twice:
+    // the operands in, the inverse out.
+    CATLASS_DEVICE
+    void ComputeNeumannL1(K1AicBufs& bufs, Params const& params, int headIdx,
+                          TileSpan const& span)
+    {
+        AscendC::GlobalTensor<BF16> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+
+        AscendC::Nd2NzParams p;
+        p.ndNum = 1;
+        p.nValue = CHUNK;
+        p.dValue = CHUNK;
+        p.srcNdMatrixStride = 0;
+        p.srcDValue = CHUNK;
+        p.dstNzC0Stride = CHUNK;
+        p.dstNzNStride = 1;
+        p.dstNzMatrixStride = 0;
+
+        // In: L, (I - L), and the identity.
+        AscendC::DataCopy(bufs.template L1<BF16>(K1L1::kNeuA),
+                          gm[Slot(span, headIdx, 5) / 2], p);      // L
+        AscendC::DataCopy(bufs.template L1<BF16>(K1L1::kNeuPA),
+                          gm[Slot(span, headIdx, 0) / 2], p);      // I - L
+        AscendC::DataCopy(bufs.template L1<BF16>(K1L1::kNeuI),
+                          gm[Ws(span, headIdx, WorkspaceOffsets::kIdentity) / 2], p);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>((event_t)2);
+
+        // (I + L)^-1 = (I - L)(I + L^2)(I + L^4)(I + L^8).
+        // L powers ping-pong kNeuA/kNeuB, the product kNeuPA/kNeuPB.
+        Gemm16L1(bufs, K1L1::kNeuA, K1L1::kNeuA, K1L1::kNeuB);                    // L^2
+        Gemm16FusedL1(bufs, K1L1::kNeuPA, K1L1::kNeuI, K1L1::kNeuB, K1L1::kNeuPB);
+        Gemm16L1(bufs, K1L1::kNeuB, K1L1::kNeuB, K1L1::kNeuA);                    // L^4
+        Gemm16FusedL1(bufs, K1L1::kNeuPB, K1L1::kNeuI, K1L1::kNeuA, K1L1::kNeuPA);
+        Gemm16L1(bufs, K1L1::kNeuA, K1L1::kNeuA, K1L1::kNeuB);                    // L^8
+
+        // Last factor goes to GM, where kernel2 reads it.
+        Gemm16FusedFromL1ToGm(bufs, params, K1L1::kNeuPA, K1L1::kNeuI, K1L1::kNeuB,
+                              Ws(span, headIdx, WorkspaceOffsets::kINV));
+    }
+
+    // Final step of the L1 chain: operands in L1, result to GM.
+    CATLASS_DEVICE
+    void Gemm16FusedFromL1ToGm(K1AicBufs& bufs, Params const& params, uint32_t aL1,
+                               uint32_t b1L1, uint32_t b2L1, int64_t dstByte)
+    {
+        auto l0A = bufs.template L0A<BF16>();
+        auto l0B = bufs.template L0B<BF16>();
+        auto l0C = bufs.template L0C<float>();
+
+        AscendC::LoadData2DParams ld;
+        ld.startIndex = 0;
+        ld.repeatTimes = 1;
+        ld.srcStride = 1;
+        ld.dstGap = 0;
+        ld.ifTranspose = false;
+        AscendC::LoadData(l0A, bufs.template L1<BF16>(aL1), ld);
+        AscendC::LoadData(l0B, bufs.template L1<BF16>(b1L1), ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        AscendC::MmadParams mp;
+        mp.m = CHUNK;
+        mp.n = CHUNK;
+        mp.k = CHUNK;
+        mp.cmatrixInitVal = true;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+
+        AscendC::LoadData(l0B, bufs.template L1<BF16>(b2L1), ld);
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>((event_t)1);
+
+        mp.cmatrixInitVal = false;
+        AscendC::Mmad(l0C, l0A, l0B, mp);
+
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>((event_t)4);
+        AscendC::SetFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>((event_t)1);
+
+        AscendC::FixpipeParamsV220 fp;
+        fp.nSize = CHUNK;
+        fp.mSize = CHUNK;
+        fp.srcStride = CHUNK;
+        fp.dstStride = CHUNK;
+        fp.quantPre = QuantMode_t::F322BF16;
+        AscendC::GlobalTensor<BF16> out;
+        out.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
+        AscendC::Fixpipe<BF16, float, AscendC::CFG_ROW_MAJOR>(out[dstByte / 2], l0C, fp);
+
+        AscendC::SetFlag<AscendC::HardEvent::FIX_M>((event_t)1);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_M>((event_t)1);
         AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
     }
