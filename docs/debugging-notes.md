@@ -410,3 +410,43 @@ Related and also settled: an AIC-side skew deeper than this is **not available**
 genuinely cannot start chunk c+1's vector work before the cube has produced it.
 The AIC/AIV alternation in this kernel is a true data dependency, not a
 handshake artifact — which is the useful thing the exercise established.
+
+## The cube is latency-bound on mem-in, and the FIX_MTE2 barrier is why — but it is load-bearing
+
+Post-subblock-split, `cube mem-in` is the busiest pipe in kernel2 (0.299
+against a MAC ratio of 0.025). Quantifying what it actually moves:
+
+    PreGemms A: k_dec + q_dec     8.0 KB
+    PreGemms B: state bf16       32.0 KB
+    PostGemms: INV, u             4.5 KB
+    PostGemms: Mqk, uu            4.5 KB
+    GemmAt: kres, uu              8.0 KB
+    per chunk                    57.0 KB   -> 0.89 GB total
+
+0.89 GB in the 3.11 ms that pipe is busy is **287 GB/s against ~800 available**.
+So it is *latency*-bound, not bandwidth-bound — the pipe is busy 30% of the
+time moving very little, which means small transfers that do not overlap.
+
+Why they do not overlap: every `Gemm` opens with a `FIX_MTE2` barrier, which
+blocks this gemm's GM loads behind the *previous* gemm's Fixpipe.
+
+Two attempts to relax it:
+
+- **Move it to just before `Drain`**, where the write actually happens.
+  15.89 ms against 16.26, −2.3%, and **0/12**.
+- **Make it conditional**, skipping it in `PreGemms` where the two gemms write
+  different slots and read neither (`PostGemms` genuinely needs it: `Gemm(INV,
+  u)` writes `uu` and both later gemms read it). 15.76 ms, −3.1%, and
+  **11/12** — every case's error degraded slightly (baseline 6.54e-3 → 7.69e-3)
+  with T=48 tipping past tolerance at 3.5e-2.
+
+That 11/12 is the informative one. A uniform small degradation with one case
+crossing the line is a *partially ordered read*, not a clean dependency break —
+so `PreGemms` does have a hazard the barrier covers, beyond the
+gemm-reads-previous-gemm's-output one I enumerated. The state as B operand is
+written by the AIV, so it is not that either; something else in the load path
+is ordered by this barrier.
+
+Both reverted. The 3% is real and available if the actual hazard is identified,
+but not worth taking blind — and the error degrading *everywhere* while only
+one shape fails is exactly the pattern that would pass a less thorough sweep.
