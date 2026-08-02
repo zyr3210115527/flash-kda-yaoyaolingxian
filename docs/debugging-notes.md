@@ -297,3 +297,47 @@ intended future and the old size was wrong for it.
 The 4% is worth returning to, and the m=16 problem it attacks is the same one
 CHUNK is stuck on — a fused m=32 gemm here would be a cheaper partial win than
 raising CHUNK, since it needs no decay re-basing.
+
+## The CHUNK ceiling is CHUNK · |lower_bound| ≤ ~88, and it is shared with the reference
+
+Kimi's round-2 notes suggested the CUDA/FLA reference avoids the
+`exp(−cumsum)` overflow entirely by never forming the reciprocal — binding
+a = b = k so the 1/Γ factors cancel. Checked against the reference in this
+repo, and it does not transfer, for two reasons.
+
+**The gate is per-channel.** `FlashKDA/csrc/smxx/fwd_kernel1.cuh` cumsums down
+rows *within a column* and stores `[CHUNK, D]`:
+
+    for (int row = 0; row < CHUNK; ++row) { sum += g_val;
+                                            g_smem[row * D + col] = sum; }
+
+So `exp(g_i − g_j)` is `[C, C, D]`, not `[C, C]`, and cannot be pulled out of
+the `k_i · k_j` dot product as a scalar — the exponent varies along the
+contracted dimension. The identity `A[i][j] = (k_i·k_j)·exp2(g_i − g_j)` holds
+only for a scalar per-head gate.
+
+**The reference forms `k_inv` explicitly**, same file:
+
+    BF16 inv_cumsum = BF16(ex2_approx_ftz_f32(-g));
+    r_ki(0, v) = k * inv_cumsum;
+    mma_m16n16_bf16bf16fp16_1warp(k_decayed, k_inv, L_fp16, compute_tid);
+
+Identical structure to this port, and `constexpr int CHUNK = 16` there too. The
+FLA Triton kernel at chunk 64 is a different implementation.
+
+**The shared bound.** The reference keeps `k_inv` in bf16, which has fp32's
+8-bit exponent, so the ceiling is the same. Per-step decay is bounded by
+`|gate_scale|` since `gate = gate_scale · sigmoid(...)`. And the log bases
+cancel rather than differing — reference uses
+`gate_scale = lower_bound · log2(e)` with `ex2`, this port uses raw
+`lower_bound` with natural `Exp`. So for both:
+
+    CHUNK · |lower_bound| <= ~88
+
+CHUNK=16 at lower_bound=-5 is 80, inside 88 but only just — which is exactly
+the measured behaviour (-5 overflows at CHUNK=32, -2 gives 1.98e20, -1 gives
+5.27e9). CHUNK=32 needs |lower_bound| <= 2.75; CHUNK=64 needs <= 1.375.
+
+So raising CHUNK is not a formulation choice available in the kernel. It trades
+against a model parameter, and a larger-CHUNK build should range-check
+`lower_bound` at launch rather than assume.

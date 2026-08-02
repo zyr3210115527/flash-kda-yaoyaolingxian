@@ -275,7 +275,19 @@ int64_t sync_onearg(int64_t n, int64_t h, int64_t iters) {
     return 0;
 }
 
+int64_t persub_flag(int64_t n, int64_t h, int64_t iters) {
+    FwdParams params{};
+    params.N = int(n);
+    params.H = int(h);
+    params.chunk_idx = int(iters);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
+    flash_kda::launch_persub_flag(params, stream);
+    return 0;
+}
+
 PYBIND11_MODULE(_C, m) {
+    m.def("persub_flag", &persub_flag, "per-subblock flagId probe",
+          py::arg("n"), py::arg("h"), py::arg("iters") = 8);
     // Tests and benchmarks read the chunk size from here rather than
     // hardcoding it. A dozen files had their own `CHUNK = 16`, which is exactly
     // how a test silently stops matching the kernel it is checking.
