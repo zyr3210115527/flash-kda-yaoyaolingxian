@@ -341,3 +341,42 @@ the measured behaviour (-5 overflows at CHUNK=32, -2 gives 1.98e20, -1 gives
 So raising CHUNK is not a formulation choice available in the kernel. It trades
 against a model parameter, and a larger-CHUNK build should range-check
 `lower_bound` at launch rather than assume.
+
+## The full mode-0x2 arming rule (measured 2026-08-03)
+
+Kimi's §1(a) question: when two AIV subblocks are in different phases, can
+per-subblock flagIds express it? Three probes settle the rule.
+
+1. **sub0 sets flag 3, sub1 sets flag 4, AIC waits 3 then 4** — deadlock.
+2. **both subblocks set flag 3 AND flag 4, AIC waits 3 then 4** — completes,
+   and is stable at 8, 64 and 512 iterations.
+3. (earlier) **both set one shared flag, AIC waits twice** — deadlock.
+
+So arming is **per flagId, but collective over the AI Core's AIV group**:
+
+> An AIC wait on flagId X is satisfied only once *every* AIV in the core's
+> group has set X. One wait consumes the whole group's set of X.
+
+Both halves matter and they are easy to conflate. Multiple flagIds *are*
+distinguishable — probe 2 shows two flags carrying two separate events works —
+but a single subblock can never arm a flag alone. So:
+
+- **Possible**: several flagIds, each meaning a different event, each set by
+  both subblocks. Probe 2, stable to 512 iterations.
+- **Not possible**: using flagId identity to tell the subblocks apart, e.g.
+  "flag 3 means sub0 finished phase c+1, flag 4 means sub1 finished phase c".
+  That is exactly probe 1, and it hangs.
+
+Consequence for the skewed pipeline: Kimi's design (a) — per-subblock flagIds
+letting the two AIVs sit in different phases — is **not expressible**. Design
+(b) is the whole space: keep the handshakes phase-symmetric and reached by both
+subblocks, and skew the *work* between them. That is what the 8/20 uneven
+StoreOut/DecayState split already does, and it generalises.
+
+Which is a constraint on the design but not a blocker: the AIC-side skew Kimi
+described (AIC runs PreGemms(c+1) while the AIVs finish chunk c's vector work)
+never needs the two AIVs in different phases — only the AIC ahead of both. That
+remains expressible with symmetric flags, and multiple flagIds are available to
+separate the extra handshake it needs.
+
+Probe: `_C.persub_flag(n, h, iters)`, `FlashKdaPerSubFlag` in fwd_kernel2.asc.
