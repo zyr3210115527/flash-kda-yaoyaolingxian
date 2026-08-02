@@ -265,11 +265,25 @@ What was checked and was not the cause:
   stayed at exactly 1.727), so it was not the fault, though the sizing was
   genuinely wrong and the fix is kept.
 
-Still unexplained. The obvious next probe — dump slots 4 and 6 and compare
-against `k_dec @ state` computed on the host — cannot be run with
-`FLASH_KDA_SKIP_K2=1`, because those slots are written by kernel2, and without
-that flag kernel2 has already overwritten them by the time the workspace is
-read. It needs a probe that runs kernel2 but stops after PreGemms.
+Two further attempts, both wrong, both worth recording:
+
+- **A-operand `srcStride` derived from m.** kernel1's `Gemm128` computes it as
+  `m*16/256`, kernel2's `Gemm` hardcodes 1, and 1 is only right at m=16 — so
+  this looked like the answer. It made things *worse*, error 1.727 → 37.45,
+  which says the L1 zN layout at m=32 is in fact what `srcStride = 1`
+  describes, and the fault is elsewhere.
+- **A host-side diff of slots 4 and 6.** Ran it against the full pipeline
+  rather than `FLASH_KDA_SKIP_K2=1` (those slots are kernel2's, so the flag
+  leaves them empty) — and got all zeros *including for the host reference*,
+  because at that probe's inputs `k_decayed` is itself zero. The probe was
+  measuring nothing. A useful reminder that a reference agreeing with the
+  kernel at 0.0000 is not agreement.
+
+So the diagnosis is still open, and the honest summary is that four separate
+hypotheses have been eliminated without finding it. What is needed is a probe
+that runs kernel2 with non-degenerate inputs and reads slots 4 and 6 before the
+next chunk overwrites them — one chunk, realistic k/g, and a host reference
+that is verified non-zero first.
 
 **Kept:** the slot reordering that makes 4 and 6 adjacent
 (`WorkspaceSizes::NarrowIndex`). It is neutral on time (16.26 either way) and
