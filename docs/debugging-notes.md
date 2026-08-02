@@ -240,3 +240,46 @@ Parked at `MIX_AIC_1_1`, 21.63 ms, 12/12, 6/6 clean race probes. The prize is
 real (perfect overlap would put kernel2 near 6.6 ms rather than 13.2), but it
 needs the actual flag protocol for 1:2, which likely means a documentation
 source rather than more black-box probing.
+
+## PreGemms at m=32: faster and wrong, parked with the diagnosis half-done
+
+The counters after the subblock split put `cube mem-in` as the busiest pipe in
+both kernels (0.351 kernel1, 0.296 kernel2) against a cube MAC ratio of
+0.025–0.044. The cube is starved on operands, and the reason is m=16: every
+Mmad is one fractal row.
+
+`PreGemms` is the natural place to attack it. It runs `k_dec @ state` and
+`q_dec @ state` — same B operand, and `k_decayed`/`q_decayed` are already
+adjacent in the workspace. So `[k_dec; q_dec]` loads as one `[2*CHUNK, D]` A
+operand and the pair becomes a single m=32 gemm. Same MAC work, double the m.
+
+Measured: **15.63 ms against 16.26, about 4%** — and 1/12 correct.
+
+What was checked and was not the cause:
+- `LoadNd2Nz` handles m=32 (it takes `rows` and sets `nValue`/`dstNzC0Stride`
+  from it);
+- `repeatTimes = (m/16)*(k/16)` scales;
+- `Drain`'s Fixpipe uses `mSize = m`, `srcStride = m`;
+- the L1 A buffer overrunning into `kB` — `kA` was sized `CHUNK*D*2` and the
+  fused load writes twice that. Doubling it changed nothing (the error value
+  stayed at exactly 1.727), so it was not the fault, though the sizing was
+  genuinely wrong and the fix is kept.
+
+Still unexplained. The obvious next probe — dump slots 4 and 6 and compare
+against `k_dec @ state` computed on the host — cannot be run with
+`FLASH_KDA_SKIP_K2=1`, because those slots are written by kernel2, and without
+that flag kernel2 has already overwritten them by the time the workspace is
+read. It needs a probe that runs kernel2 but stops after PreGemms.
+
+**Kept:** the slot reordering that makes 4 and 6 adjacent
+(`WorkspaceSizes::NarrowIndex`). It is neutral on time (16.26 either way) and
+12/12, and it is the prerequisite for the fusion — without it the two outputs
+are separated by slot 5 and no fused gemm is possible. Slot 5 is kernel1's
+plain L, live only inside `ComputeNeumann`, so nothing observes the move.
+
+**Kept:** the `kA` L1 sizing fix, since a fused load of that shape is the
+intended future and the old size was wrong for it.
+
+The 4% is worth returning to, and the m=16 problem it attacks is the same one
+CHUNK is stuck on — a fused m=32 gemm here would be a cheaper partial win than
+raising CHUNK, since it needs no decay re-basing.

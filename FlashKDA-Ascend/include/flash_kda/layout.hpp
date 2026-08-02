@@ -158,10 +158,28 @@ struct WorkspaceSizes {
     // this header is not visible to device code on this toolchain.
     static constexpr int SlotOffset(int i)
     {
+        // Narrow slots are laid out 0,1,2,4,6,5,8 rather than in index order,
+        // so that 4 and 6 are adjacent.
+        //
+        // kernel2's PreGemms computes k_dec @ state into slot 4 and
+        // q_dec @ state into slot 6 with the same B operand. k_decayed and
+        // q_decayed are already adjacent in the workspace, so if the outputs
+        // are adjacent too the pair becomes a single m=32 gemm instead of two
+        // at m=16 -- and m=16 is exactly what the counters say is starving the
+        // cube (MAC ratio 0.025, mem-in 0.296).
+        //
+        // Slot 5 moves out of the way. It is kernel1's plain L, live only
+        // inside ComputeNeumann, so nothing observes the reordering.
         return (i == 3) ? 0
              : (i == 7) ? kScratchSlot
-             : kScratchSlot * kNumWide +
-               kNarrowSlot * ((i < 3) ? i : (i < 7) ? (i - 1) : (i - 2));
+             : kScratchSlot * kNumWide + kNarrowSlot * NarrowIndex(i);
+    }
+
+    static constexpr int NarrowIndex(int i)
+    {
+        return (i == 0) ? 0 : (i == 1) ? 1 : (i == 2) ? 2
+             : (i == 4) ? 3 : (i == 6) ? 4      // adjacent pair
+             : (i == 5) ? 5 : 6;                // slot 5, then slot 8
     }
 
     static constexpr int64_t kPerTile =
