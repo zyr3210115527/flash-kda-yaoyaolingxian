@@ -29,8 +29,12 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, 'tests'))
 
 CHUNK, D = 16, 128
-OFF_INV, OFF_MQK = 16896, 17408
-SCRATCH, SLOT = 18432, 65536
+# From the extension. These offsets have moved twice -- once when the workspace
+# shrank from 608 KB to 207 KB per tile, once when the narrow slots were
+# reordered so 4 and 6 are adjacent -- and a hardcoded copy reads the wrong tile
+# while looking perfectly plausible.
+OFF_INV, OFF_MQK = _kda_C.WS_OFF_KINV, _kda_C.WS_OFF_KMQK
+SCRATCH = _kda_C.WS_OFF_SCRATCH
 
 
 def slot(i):
@@ -53,7 +57,9 @@ def rel(a, b):
 
 
 def main():
-    import torch_npu  # noqa: F401
+    import torch_npu  # noqa
+
+from flash_kda import _C as _kda_C: F401
     from flash_kda import _C
 
     dev = torch.device("npu:0")

@@ -39,13 +39,14 @@ CHUNK = _kda_C.CHUNK
 
 DEV = torch.device("npu:0")
 D = 128
-PER_TILE = 608256
-SCRATCH = 18432
-SLOT = 65536
+PER_TILE = _kda_C.WS_PER_TILE
+SCRATCH = _kda_C.WS_OFF_SCRATCH
+# Slots are no longer uniformly sized (two wide, seven narrow), so a
+# base + i*stride formula no longer works; WS_SLOT_OFF is the mapping.
 
 
 def slot_fp32(ws_u8, units, which):
-    off = SCRATCH + which * SLOT
+    off = _kda_C.WS_SLOT_OFF[which]
     blocks = ws_u8[: units * PER_TILE].view(units, PER_TILE)
     raw = blocks[:, off: off + CHUNK * CHUNK * 4].contiguous()
     return raw.view(torch.float32).view(units, CHUNK, CHUNK)

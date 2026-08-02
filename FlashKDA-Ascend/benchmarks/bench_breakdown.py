@@ -1,14 +1,16 @@
-"""Break the Ascend forward time down: kernel1 vs kernel2 vs launch overhead.
+"""SUPERSEDED -- kept for the record, do not trust its numbers.
 
-The aggregate is ~790x the CUDA reference per token-head, which on its own does
-not say what to fix. This separates:
+This harness calls the `flash_kda.fwd` wrapper, which at the time allocated the
+workspace on every call: 302 MB of host-side zeros copied to the device per
+invocation at T=1024 H=8. That was 88-98% of everything it measured, and it is
+where the "790x slower than CUDA" figure came from. The wrapper now caches the
+workspace, so the allocation is gone, but this file is left as the artifact that
+made the mistake visible.
 
-  - kernel1 alone            (4 launches, FLASH_KDA_SKIP_K2=1)
-  - full pass                (4 + 2 + 5*chunks launches)
-  - an empty kernel launch   (_C.noop, to price the launch itself)
-
-so the fraction that is launch overhead versus actual compute is visible.
+Use benchmarks/ab_compare.py (interleaved A/B, medians, resolves ~1%) or
+benchmarks/bench_cuda_shapes.py (the reference shapes) instead.
 """
+
 import math
 import os
 import sys

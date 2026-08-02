@@ -38,7 +38,7 @@ CHUNK = _kda_C.CHUNK
 
 DEV = torch.device("npu:0")
 D = 128
-PER_TILE = 608256          # WorkspaceSizes::kPerTile
+PER_TILE = _kda_C.WS_PER_TILE   # from the extension: it has moved twice
 
 FIELDS = [
     ("k_decayed",  0,     CHUNK * D,     2),
@@ -46,23 +46,23 @@ FIELDS = [
     ("k_inv",      8192,  CHUNK * D,     2),
     ("k_restored", 12288, CHUNK * D,     2),
     ("g_total",    16384, D,             4),
-    ("INV",        16896, CHUNK * CHUNK, 2),
-    ("Mqk",        17408, CHUNK * CHUNK, 2),
+    ("INV",        _kda_C.WS_OFF_KINV, CHUNK * CHUNK, 2),
+    ("Mqk",        _kda_C.WS_OFF_KMQK, CHUNK * CHUNK, 2),
     # The Neumann chain's inputs, which the first version of this probe missed:
     # slot 0 holds (I - L), slot 5 holds plain L, and kIdentity holds I. All
     # three are written by AIV and read by the AIC chain, so if any of them
     # moves, the corruption is upstream of the cube entirely.
-    ("identity",   17920, CHUNK * CHUNK, 2),
-    ("s0_ImL",     18432, CHUNK * CHUNK, 2),
-    ("s5_L",       18432 + 5 * 65536, CHUNK * CHUNK, 2),
+    ("identity",   _kda_C.WS_OFF_IDENTITY, CHUNK * CHUNK, 2),
+    ("s0_ImL",     _kda_C.WS_SLOT_OFF[0], CHUNK * CHUNK, 2),
+    ("s5_L",       _kda_C.WS_SLOT_OFF[5], CHUNK * CHUNK, 2),
     # Slot 0 holds the FIRST Gemm128's fp32 output (L, 1024 bytes), which AIV
     # later overwrites in place with bf16 (I - L) -- but only the first 512
     # bytes. Bytes 512..1024 are still the raw cube result for rows 8..15, so
     # reading them says whether the cube itself produced garbage or whether the
     # AIV rewrite did. Slot 1 is the SECOND Gemm128's fp32 output and is never
     # overwritten, so it is the control.
-    ("s0_cube_fp32", 18432 + 512,           128,           4),
-    ("s1_cube_fp32", 18432 + 65536,   CHUNK * CHUNK,       4),
+    ("s0_cube_fp32", _kda_C.WS_SLOT_OFF[0] + 512,   128,          4),
+    ("s1_cube_fp32", _kda_C.WS_SLOT_OFF[1], CHUNK * CHUNK,       4),
 ]
 AIV = {"k_decayed", "q_decayed", "k_inv", "k_restored", "g_total"}
 

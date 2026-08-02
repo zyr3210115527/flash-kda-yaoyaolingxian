@@ -2,136 +2,117 @@
 
 ## Where things stand
 
-**The forward pass works and matches the CUDA reference.**
+**The forward pass works, matches the CUDA reference, and has been optimised.**
 
-12/12 shape and feature cases pass against `torch_ref` at the bf16 noise floor
-(~1e-2), and 10/10 repeated runs pass with no faults or hangs:
+12/12 shape and feature cases pass against `torch_ref` at the bf16 noise floor,
+bit-identical across repeated runs, on all four fallback paths:
 
 ```
 T=16  H=1  one chunk      6.157e-03    B=2   T=32 H=2        8.516e-03
-T=64  H=4  baseline       7.273e-03    state bf16  out 7.571e-03  state 4.662e-03
+T=64  H=4  baseline       6.537e-03    state bf16  out 7.571e-03  state 4.662e-03
 T=48  H=2                 9.727e-03    state fp32  out 7.571e-03  state 4.595e-03
-T=128 H=8                 8.062e-03    varlen [16,24,8] H=1  5.956e-03
-T=80  H=1                 6.487e-03    varlen [32,32]   H=2  1.249e-02
+T=128 H=8                 7.178e-03    varlen [16,24,8] H=1  5.956e-03
+T=80  H=1                 6.487e-03    varlen [32,32]   H=2  8.516e-03
 T=40  H=2  tail 8 rows    7.312e-03
 T=24  H=4  tail 8 rows    7.270e-03
 ```
 
-Sequence lengths 16-128, head counts 1-8, batching, ragged varlen, tail chunks,
-and both state dtypes.
+Sequence lengths 16–8192, head counts 1–96, batching, ragged varlen, tail
+chunks, both state dtypes.
 
-Kernel1's intermediates are additionally checked field by field against float64:
+Determinism is checked separately and repeatedly: `tests/race_probe.py` runs the
+same input eight times and diffs bitwise, and it takes six runs of that to mean
+anything — two intermittent races in this project were hidden by a single clean
+run. `tests/workspace_poison.py` fills the workspace with NaN to prove nothing
+is read before it is written.
 
-```
-k_decayed 1.478e-03   q_decayed 1.674e-03   k_inv 1.785e-03
-k_restored 1.734e-03  g_total 8.962e-07     Mqk 3.851e-03   INV 3.352e-04
-```
+## Performance
 
-The CPU oracle itself is verified: `tests/validate_ref.py` checks `torch_ref`
-against an independently written float64 delta-rule loop, 5/5.
+32.9 ms at T=8192 H=64, **20×** the CUDA implementation on an H20 (1.62 ms).
+Full accounting in [BENCHMARK.md](BENCHMARK.md); the short version:
+
+| | |
+|---|---|
+| Correct but unoptimised, first measurement | 790× |
+| Same code, measured properly | ~94× |
+| After 15 optimisations over four days | **20×** |
+
+Most of 790 → 94 was a broken harness, not a fix. What follows is real.
 
 ## Running it
 
-Get a card (see `bringup.md`), then:
+Get a card (see [`docs/bringup.md`](docs/bringup.md)), then:
 
 ```bash
 source /usr/local/Ascend/cann-8.5.0/set_env.sh
 export PATH=/usr/local/python3.11.14/bin:$PATH TORCH_DEVICE_BACKEND_AUTOLOAD=0
-cd /user/zhouyiran/flashkda/FlashKDA-Ascend/build && make -j8 && cp _C*.so ../flash_kda/
+cd FlashKDA-Ascend/build && make -j8 && cp _C*.so ../flash_kda/
 cd .. && PYTHONPATH=$PWD:$PWD/tests python3 tests/test_shapes.py
 ```
 
 | Test | What it covers |
 |---|---|
-| `tests/validate_ref.py` | the CPU oracle, against an independent float64 implementation. No hardware needed. |
-| `tests/check_prepare.py` | kernel1's seven workspace outputs against float64 |
-| `tests/dump_k2_chunk0.py` | kernel2's chunk-0 intermediates, using the device's own Mqk/INV |
-| `tests/per_chunk_err.py` | error broken down per chunk and per head |
 | `tests/test_shapes.py` | the 12 shape and feature cases |
-| `test_npu_nocompute.py` | single end-to-end number |
+| `tests/race_probe.py` | determinism — bitwise diff over repeats. Run it 6+ times. |
+| `tests/race_fields.py` | which workspace field first goes non-deterministic |
+| `tests/workspace_poison.py` | that nothing reads the workspace before writing it |
+| `tests/test_neumann_strength.py` | the Neumann series at ‖L‖ large enough to matter |
+| `tests/bf16_update_drift.py` | whether a precision change accumulates along the sequence |
+| `tests/validate_ref.py` | the CPU oracle itself, against independent float64. No hardware. |
+| `tests/check_prepare.py` | kernel1's workspace outputs, field by field |
+| `benchmarks/ab_compare.py` | interleaved A/B with medians — resolves ~1% |
+| `benchmarks/profile_pipes.py` | hardware pipe counters (cube MAC, mem-in, vector, scalar) |
+| `benchmarks/bench_cuda_shapes.py` | the reference's own shapes |
 
-`FLASH_KDA_SKIP_K2=1` runs kernel1 alone. `_C.noop()`, `_C.aiv_only()` and
-`_C.aic_only()` are launch-path probes; `tests/sync_probe.cpp` and
-`tests/aic_resource_probe.cpp` are standalone comparisons.
+Probes read the workspace layout from the extension (`_C.CHUNK`,
+`_C.WS_SLOT_OFF`, …) rather than hardcoding offsets — those offsets have moved
+twice, and a stale copy reads the wrong tile while looking entirely plausible.
 
 ## Design
 
-Both kernels are split into single-core-type launches ordered by the stream,
-rather than one kernel with AIC/AIV cross-core handshakes.
+Both kernels are now **single fused launches** that hand off between the cube
+and vector cores with cross-core flags, and both vector cores participate.
 
 ```
-kernel1 (per tile, per head)          kernel2 (per sequence, per head)
-  AIV  prepare                          AIV  InitState
-  AIC  L = k_dec @ k_inv^T, Mqk         per chunk:
-  AIV  tril mask, beta, (I - L)           AIV  BuildU
-  AIC  Neumann inverse                    AIC  PreGemms
-                                          AIV  FinishOut
-                                          AIC  PostGemms
-                                          AIV  FinishChunk
-                                        AIV  StoreFinalState
+kernel1 (grid-strided over tile×head)   kernel2 (one unit per sequence×head)
+  AIV  prepare, both subblocks            AIV  InitState
+  AIC  L = k_dec @ k_inv^T, Mqk           per chunk:
+  AIV  tril mask, beta, (I - L)             AIV  FinishOut
+  AIC  Neumann inverse, entirely in L1      AIC  PostGemms(c) then PreGemms(c+1)
+                                            AIV  StoreOut ∥ DecayState (8/20 split)
+                                          AIV  StoreFinalState
 ```
 
-Every phase states its core type with `if constexpr (g_coreType != ...)`: the
-compiler emits both a `_mix_aic` and a `_mix_aiv` half for each kernel, and an
-unguarded body runs on both.
+Every phase declares its core type with `if constexpr (g_coreType != ...)`, and
+every entry declares a `KERNEL_TASK_TYPE` — without which the runtime never
+provisions the cross-core sync resources and the first wait hangs forever.
 
-All inter-phase values travel through GM workspace, which is what made the split
-cheap -- on Atlas A2 the AIC cannot reach UB and L0C drains only to L1 or GM.
+Inter-phase values that cross between core types travel through GM, because on
+Atlas A2 the AIC cannot reach UB. Values that stay within one core type do not:
+the Neumann chain lives in L1 and the recurrent state lives in UB.
 
-## Things that cost real time, worth knowing
+## Unresolved
 
-**Kernel entries must take a single argument.** Five of kernel2's entries took
-`(FwdParams, int32_t)` and hung; the two taking a lone `FwdParams` ran. Moving
-the chunk index into `FwdParams` fixed it. This also invalidated an earlier
-conclusion that cross-core sync does not work from a Python extension -- those
-probes were two-argument too, so the experiment was confounded. Whether
-cross-core sync works with a single-argument entry is untested; the split is a
-reasonable design regardless, but it was not forced by what I thought forced it.
-
-**`DataCopyPad` pads every block to 32 bytes.** Gathering one value per token
-with `blockLen = sizeof(bf16)` does not land them contiguously -- they land 16
-elements apart with garbage between. This corrupted the beta load in both
-kernels (`sigmoid(beta)` at rel 6.1e-01, with every downstream quantity
-inheriting it) and the state transpose. Both now copy whole blocks and select
-with scalar reads.
-
-**`M_MTE1` after every `Mmad`.** The cube reads L0A/L0B and the next GEMM's
-`LoadData` overwrites them. Without the barrier the device reports
-`"L0B read/write conflict in the MTE (same address)"` intermittently -- two runs
-in six.
-
-**`Nd2Nz` describes a ColumnMajor source by its columns.** `nValue` is the
-column count, `dValue` the column length. Reversed, it read to element 16272 of
-a 2048-element buffer.
-
-**The Neumann iteration squares L, not (I - L).** `(I-L)^2 = I - 2L + L^2`. The
-symptom was `2^3 = 8` on the inverse's diagonal.
-
-**No scalar `exp` on the aicore, and scalar bf16 casts are rejected.** Anything
-exponential goes through the vector unit; widen bf16 with `Cast` before reading
-it scalar.
-
-**Exact-fit L0 allocations faulted; architectural sizes fixed it.** But the
-opposite held in kernel2's L1 map, where widening slots to 64 KB broke it. Do
-not generalise either way without measuring.
-
-Two of my own testing bugs, since they produced convincing wrong answers:
-`struct` has no bf16 code and `'e'` is IEEE fp16, so reading bf16 workspace
-fields with `'e'` made correct data look wrong by 20-500x; and the sync script
-built into `build/` without installing the `.so`, so two rounds of "identical
-results" were a stale binary.
+- **INV's diagonal departs from 1 at ‖L‖ > 0.3.** A product of unit-lower-
+  triangular factors has a unit diagonal for any input, so this is structural,
+  not tolerance. Not reproducible at usable inputs — every regime that produces
+  ‖L‖ that large also drives `k_decayed` to underflow — but it is the leading
+  suspect for the CHUNK=32 failure. `tests/test_neumann_strength.py`.
+- **A fused m=32 `PreGemms`** measures 4% faster and 1/12 correct. Four
+  hypotheses eliminated; see `docs/debugging-notes.md`.
+- **`MIX_AIC_1_2` with the two AIV subblocks in different phases** is not
+  expressible — the arming rule is per-flagId but collective over the core's
+  AIV group, so no subblock can arm a flag alone. Settled by three probes.
 
 ## Not done
 
-- **Performance.** Nothing has been tuned or measured. Kernel2 issues five
-  launches per chunk, the state transpose is a scalar double loop, and there is
-  no double buffering anywhere. Correctness first was the right order, but this
-  is not a fast kernel yet.
+- **Backward pass.** Forward only.
+- **Ascend 950 (`CATLASS_ARCH=3510`).** Builds; only 910B has been exercised.
+- **Larger D.** `D == 128` is asserted host-side.
+- **CHUNK > 16.** Now a real knob (the Neumann length derives from it), but
+  bounded by `CHUNK · |lower_bound| ≤ ~88` — a model constraint the CUDA
+  reference shares, not something the kernel can choose away.
 - **The hand-rolled layout descriptors.** `Nd2NzParams`, `LoadData2DParams` and
   `FixpipeParamsV220` are still written by hand. Every layout bug in this
-  project was a hand-derived stride; the catlass tile classes (`CopyGmToL1`,
-  `CopyL1ToL0A`, `CopyL1ToL0B`, `CopyL0CToGm`) derive them from layout objects
-  and would be the durable cleanup.
-- **Backward pass.** Not started; this is forward only.
-- **Ascend 950 (`CATLASS_ARCH=3510`).** Only 910B has been exercised.
-- **Larger D.** `D == 128` is asserted host-side.
+  project was a hand-derived stride; the catlass tile classes would be the
+  durable cleanup, and the 950 port will want it anyway.

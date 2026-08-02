@@ -191,9 +191,10 @@ CHUNK = _kda_C.CHUNK
     exp = gate_and_decay(q[0, :, 0], k[0, :, 0], g[0, :, 0], None,
                          A_log[0], dt_bias[0], scale, lower_bound)
 
-    # Cube outputs. Offsets follow WorkspaceOffsets: kINV = 16896, kMqk = 17408.
-    got['INV'] = field(16896, CHUNK * CHUNK, 'e', 2).reshape(CHUNK, CHUNK)
-    got['Mqk'] = field(17408, CHUNK * CHUNK, 'e', 2).reshape(CHUNK, CHUNK)
+    # Cube outputs, at offsets read from the extension rather than copied --
+    # they have moved twice since these were written.
+    got['INV'] = field(_kda_C.WS_OFF_KINV, CHUNK * CHUNK, 'e', 2).reshape(CHUNK, CHUNK)
+    got['Mqk'] = field(_kda_C.WS_OFF_KMQK, CHUNK * CHUNK, 'e', 2).reshape(CHUNK, CHUNK)
     exp.update(cube_expect(q[0, :, 0], k[0, :, 0], g[0, :, 0], beta[0, :, 0],
                            A_log[0], dt_bias[0], scale, lower_bound))
 

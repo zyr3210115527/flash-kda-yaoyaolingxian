@@ -1,6 +1,14 @@
-"""FlashKDA-Ascend performance benchmark.
+"""SUPERSEDED -- kept for the record, do not trust its numbers.
 
-Measures throughput and latency of flash_kda.fwd() vs torch_ref.
+This harness calls the `flash_kda.fwd` wrapper, which at the time allocated the
+workspace on every call: 302 MB of host-side zeros copied to the device per
+invocation at T=1024 H=8. That was 88-98% of everything it measured, and it is
+where the "790x slower than CUDA" figure came from. The wrapper now caches the
+workspace, so the allocation is gone, but this file is left as the artifact that
+made the mistake visible.
+
+Use benchmarks/ab_compare.py (interleaved A/B, medians, resolves ~1%) or
+benchmarks/bench_cuda_shapes.py (the reference shapes) instead.
 """
 
 import torch

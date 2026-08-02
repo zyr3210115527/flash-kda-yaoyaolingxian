@@ -1,9 +1,12 @@
-"""Find the size at which the FlashKDA kernels start hanging.
+"""SUPERSEDED -- kept for the record.
 
-A single tile (T=16, H=1) completes, so the kernels do run. This sweeps tile
-and head counts to locate the boundary. Each case runs in this one process, so
-the first case that hangs is the last line printed.
+Written to find the size at which the kernels started hanging. That hang was a
+missing M_MTE1 barrier after Mmad ("L0B read/write conflict in the MTE"), fixed
+long ago; both kernels now run every shape in the sweep. Superseded by
+tests/test_shapes.py for correctness and tests/race_probe.py for the
+intermittent faults this could not see.
 """
+
 import math
 import sys
 

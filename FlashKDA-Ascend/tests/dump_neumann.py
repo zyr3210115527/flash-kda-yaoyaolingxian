@@ -26,14 +26,17 @@ D = 128
 # WorkspaceOffsets from layout.hpp
 OFF = {
     'k_decayed': 0, 'q_decayed': 4096, 'k_inv': 8192, 'k_restored': 12288,
-    'g_total': 16384, 'INV': 16896, 'Mqk': 17408, 'identity': 17920,
+    'g_total': _kda_C.WS_OFF_KGTOTAL, 'INV': _kda_C.WS_OFF_KINV,
+    'Mqk': _kda_C.WS_OFF_KMQK, 'identity': _kda_C.WS_OFF_IDENTITY,
 }
-SCRATCH = 18432
-SLOT = 65536
+SCRATCH = _kda_C.WS_OFF_SCRATCH
 
 
 def slot(i):
-    return SCRATCH + i * SLOT
+    # Slots are no longer uniformly sized (two [D,D] wide, seven [CHUNK,D]
+    # narrow) nor in index order, so base + i*stride is wrong. WS_SLOT_OFF is
+    # the mapping, exported so no probe has to know the layout.
+    return _kda_C.WS_SLOT_OFF[i]
 
 
 def bf16_at(raw, off, count):

@@ -37,8 +37,8 @@ CHUNK = _kda_C.CHUNK
 
 DEV = torch.device("npu:0")
 D = 128
-PER_TILE = 608256
-INV_OFF = 16896
+PER_TILE = _kda_C.WS_PER_TILE
+INV_OFF = _kda_C.WS_OFF_KINV
 
 
 def inv_all(ws_u8, units):
