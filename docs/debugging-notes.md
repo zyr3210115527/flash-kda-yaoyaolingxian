@@ -380,3 +380,33 @@ remains expressible with symmetric flags, and multiple flagIds are available to
 separate the extra handshake it needs.
 
 Probe: `_C.persub_flag(n, h, iters)`, `FlashKdaPerSubFlag` in fwd_kernel2.asc.
+
+## Halving kernel2's handshakes: correct, neutral, and built on bad arithmetic
+
+Restructured kernel2's chunk loop so the AIC does `PostGemms(c)` and
+`PreGemms(c+1)` in one turn instead of two, cutting the handshake from 4 round
+trips per chunk to 2. It is legal — `PostGemms(c)` needs `u(c)` from
+`FinishOut(c)`, `PreGemms(c+1)` needs slots 3 and 2 of tile c+1 which the AIV's
+end-of-chunk phase writes, and slots are keyed by `tileIdx` so c and c+1 do not
+alias. 12/12 and 6/6 clean races.
+
+**Worth 0.00 ms.** 16.26 before, 16.26 after, and the pipe ratios are unchanged
+(mem-in 0.299, MAC 0.025).
+
+The reason it was expected to help was an arithmetic mistake worth recording.
+I had computed "AIC busy 4.8 ms + AIV busy 3.3 ms = 8.1 ms against a 10.3 ms
+kernel, so 2.2 ms is handshake latency" — but `aic_*_ratio` are fractions of
+`aicore_time` and `aiv_*_ratio` are fractions of `aiv_time`, which are
+different denominators. Summing them is not meaningful. Done correctly the
+unaccounted time is ~0.64 ms, not 2.2, so there was never 2.2 ms of handshake
+to remove and the prediction was of a quantity that does not exist.
+
+Kept anyway: it is strictly fewer synchronisation points for the same work, it
+is the structure a future skew would need, and it costs nothing. But it is
+listed here as a null result, not a win.
+
+Related and also settled: an AIC-side skew deeper than this is **not available**.
+`FinishOut(c+1)` reads slot 4, which is `PreGemms(c+1)`'s output, so the AIV
+genuinely cannot start chunk c+1's vector work before the cube has produced it.
+The AIC/AIV alternation in this kernel is a true data dependency, not a
+handshake artifact — which is the useful thing the exercise established.

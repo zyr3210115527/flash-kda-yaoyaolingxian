@@ -426,7 +426,9 @@ public:
                     tileIdx = sp.tileBase + c;
                 }
 
-                // AIC is running PreGemms(c).
+                // The cube produced slot 4 / slot 6 for this chunk in its
+                // previous turn (peeled for c=0, then as PreGemms(c+1) at the
+                // end of the c-1 turn).
                 Catlass::Arch::CrossCoreWaitFlag(aicReady);
                 if (live && lead) {
                     FinishOut(bufs, params, sp.headIdx, tileIdx,
@@ -510,24 +512,44 @@ public:
             // AIV is doing InitState and BuildU(0).
             Catlass::Arch::CrossCoreWaitFlag(aivReady);
 
+            // One AIC turn per chunk instead of two.
+            //
+            // The counters account for ~4.8 ms of AIC pipe time and ~3.3 ms of
+            // AIV time in a ~10.3 ms kernel; the missing ~2.2 ms is handshake
+            // latency, 4 round trips per chunk over 256 chunks. Halving the
+            // round trips attacks exactly that.
+            //
+            // It works because PostGemms(c) and PreGemms(c+1) can run back to
+            // back: PostGemms(c) needs u(c) from FinishOut(c), and
+            // PreGemms(c+1) needs slot 3 and slot 2 of tile c+1, both written
+            // by the AIV's end-of-chunk phase. Slots are keyed by tileIdx, so
+            // c and c+1 do not alias.
+            //
+            // PreGemms for chunk 0 is peeled out before the loop.
+            if (sp.valid && sp.nTiles > 0) {
+                PreGemms(bufs, params, sp.seqIdx, sp.headIdx, sp.tileBase);
+            }
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
+
             for (int c = 0; c < maxChunks; ++c) {
                 const bool live = sp.valid && c < sp.nTiles;
                 const int tileIdx = live ? (sp.tileBase + c) : 0;
 
-                if (live) {
-                    PreGemms(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
-                }
-                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
-
-                // AIV is running FinishOut(c).
+                // AIV ran FinishOut(c); now PostGemms(c), then straight into
+                // PreGemms(c+1) without handing back in between.
                 Catlass::Arch::CrossCoreWaitFlag(aivReady);
                 if (live) {
                     PostGemms(bufs, params, sp.seqIdx, sp.headIdx, tileIdx);
                 }
                 Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
 
-                // AIV is running FinishChunk(c) and BuildU(c+1).
+                // AIV runs the end-of-chunk phase, which writes slot 3 and
+                // slot 2 for c+1; then the cube can run ahead.
                 Catlass::Arch::CrossCoreWaitFlag(aivReady);
+                if (live && c + 1 < sp.nTiles) {
+                    PreGemms(bufs, params, sp.seqIdx, sp.headIdx, tileIdx + 1);
+                }
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(aicReady);
             }
         }
     }
