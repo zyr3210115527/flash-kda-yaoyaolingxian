@@ -437,12 +437,30 @@ public:
                 // AIC is running PostGemms(c).
                 Catlass::Arch::CrossCoreWaitFlag(aicReady);
                 if (live) {
+                    // Keep the balanced half-and-half split of DecayState -- it
+                    // is 5.0 ms against StoreOut's 0.5, so handing a whole phase
+                    // to each subblock is worse balance, measured at 18.01 ms
+                    // against 16.57.
+                    //
+                    // Instead give the lead a smaller share of the rows and let
+                    // StoreOut ride in the gap. StoreOut reads slots 6 and 8 and
+                    // writes gmOut; DecayState reads slot 7 and the resident
+                    // state; they do not touch each other.
+                    //
+                    // 8/20 measured, not guessed. The curve is a clean minimum:
+                    //   5/20 16.86   6/20 16.65   7/20 16.45   8/20 16.23
+                    //   9/20 16.34   10/20 16.59  11/20 16.81
+                    // 10/20 is the even split, so the tilt is worth 0.36 ms and
+                    // it is not simply "less for the lead is better".
+                    const int leadRows = (D * 8) / 20;
+                    const int myR0 = lead ? 0 : leadRows;
+                    const int myRows = lead ? leadRows : (D - leadRows);
                     if (lead) {
                         StoreOut(bufs, params, sp.headIdx, tileIdx,
                                  sp.bos + c * CHUNK, len);
                     }
                     DecayStateResidentRows(bufs, params, sp.headIdx, tileIdx,
-                                           stateResident, r0, rowsPer);
+                                           stateResident, myR0, myRows);
                     if (c + 1 < sp.nTiles) {
                         // Same pairing the merged launch used: BuildU for the
                         // next chunk runs here, after DecayState has produced
@@ -459,7 +477,7 @@ public:
                         }
                         StateToBf16ResidentRows(bufs, params, tileIdx + 1,
                                                 sp.headIdx, stateResident,
-                                                r0, rowsPer);
+                                                myR0, myRows);
                     }
                 }
                 Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(aivReady);
@@ -469,8 +487,13 @@ public:
                 // The final state transposes across the whole tile, so each
                 // subblock publishes its rows to GM first and the lead reads a
                 // complete copy back. Once per sequence, not per chunk.
-                PublishStateRows(params, sp.seqIdx, sp.headIdx, stateResident,
-                                 r0, rowsPer);
+                {
+                    // Same uneven split the loop used, so every row is covered.
+                    const int leadRows = (D * 8) / 20;
+                    PublishStateRows(params, sp.seqIdx, sp.headIdx, stateResident,
+                                     lead ? 0 : leadRows,
+                                     lead ? leadRows : (D - leadRows));
+                }
                 // StoreFinalState reads the state back from GM, and the last
                 // chunk's DecayState wrote it from this same core moments ago.
                 // As a separate launch that ordering was free; inside one
