@@ -28,14 +28,14 @@ is read before it is written.
 
 ## Performance
 
-32.9 ms at T=8192 H=64, **20×** the CUDA implementation on an H20 (1.62 ms).
+32.58 ms at T=8192 H=64, **20×** the CUDA implementation on an H20 (1.62 ms).
 Full accounting in [BENCHMARK.md](BENCHMARK.md); the short version:
 
 | | |
 |---|---|
 | Correct but unoptimised, first measurement | 790× |
 | Same code, measured properly | ~94× |
-| After 15 optimisations over four days | **20×** |
+| After 16 optimisations over five days | **20×** |
 
 Most of 790 → 94 was a broken harness, not a fix. What follows is real.
 

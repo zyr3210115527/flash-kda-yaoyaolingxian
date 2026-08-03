@@ -17,7 +17,7 @@ Eighty-six commits later:
 | | |
 |---|---|
 | Forward pass | correct, 12/12, bit-identical across runs |
-| At the CUDA reference's own shape | 32.9 ms vs 1.62 ms on an H20 — **20×** |
+| At the CUDA reference's own shape | 32.58 ms vs 1.62 ms on an H20 — **20×** |
 | First measurement | 790× |
 | First measurement, taken correctly | ~94× |
 
@@ -129,6 +129,7 @@ reason about what should be slow, act on it, and be wrong.**
 | The scalar round trips in `DecayState` are the cost | No change, twice |
 | Casting the state from UB saves 2 GB of reads | Worth nothing — it was L2-resident |
 | Halving the handshakes recovers 2.2 ms | Worth exactly 0.00 ms |
+| Relaxing the `PreGemms` barrier is worth 3% | The 3% was a race; the safe half is worth 0.00 |
 
 That last one deserves its own confession. I computed "AIC busy 4.8 ms + AIV
 busy 3.3 ms = 8.1 ms in a 10.3 ms kernel, so 2.2 ms is handshake latency" —
@@ -198,9 +199,13 @@ documentation from someone who had never touched the hardware.**
 
 Because the failures are the useful part:
 
-1. **Trusted a single test run.** Twice. Both times an intermittent race hid
-   behind one clean pass. `race_probe.py` now needs six runs to mean anything,
-   and the suite is run repeatedly, not once.
+1. **Trusted a single test run.** Three times now. The third was the worst,
+   because I did not just miss a race — I *explained* it. A config that skipped
+   a barrier gave 11/12 with every case's error slightly degraded, and I wrote
+   several paragraphs arguing this was a "partially ordered read" rather than a
+   clean dependency break. It was a race: the same config alternates between
+   11/12 and 12/12 across runs, and its race probe is 0/6. A single sweep is not
+   evidence, and a *story* about a single sweep is worse than none.
 2. **Summed ratios with different denominators**, and optimised the imaginary
    gap it produced.
 3. **Reported a kernel corruption that was my own diagnostic** — I read a

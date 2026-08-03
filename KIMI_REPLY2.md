@@ -178,16 +178,43 @@ loads behind the *previous* gemm's Fixpipe. Two attempts to relax it:
 | moved to just before `Drain` | 15.89 ms (−2.3%) | **0/12** |
 | conditional, skipped in `PreGemms` | 15.76 ms (−3.1%) | **11/12** |
 
-The 11/12 is the interesting one. `PreGemms`' two gemms write different slots
-and read neither, and their shared B operand (the state) is written by the AIV,
-not by a preceding Fixpipe — so by my reading there is no hazard to cover. Yet
-every case's error degraded slightly (6.54e-3 → 7.69e-3) with T=48 tipping past
-tolerance at 3.5e-2. A uniform small degradation with one case crossing is a
-**partially ordered read**, not a clean dependency break.
+**Resolved before sending — and the answer corrects my own framing, so ignore
+the question I was about to ask you.**
 
-So something in `PreGemms`' load path is ordered by that barrier that I have not
-identified. If you know what `FIX_MTE2` covers beyond the obvious
-Fixpipe-write-then-MTE2-read-of-the-same-address case — L1 buffer reuse? the
-L0C→L1 path? — that is worth 3% and is the most concrete open question I have.
+Bisecting the two `PreGemms` gemms separately, four sweeps and three race probes
+per config:
+
+| barrier skipped | shape sweep | race probe |
+|---|---|---|
+| none | 12 12 12 12 | 6 6 6 |
+| first gemm only | 12 12 12 12 | 6 6 6 |
+| **second gemm only** | **11 12 11 12 11** | **0 0 0** |
+| both | 11 12 11 12 12 | 0 0 0 |
+
+The whole hazard is in the **second** gemm, and it is a **race**. The 11/12 I
+described above as "a partially ordered read" is nothing of the kind — the same
+config alternates between 11 and 12 across runs. I interpreted a single sweep,
+which is the one mistake this project keeps repeating.
+
+Skipping the *first* gemm's barrier is safe and worth **0.00 ms**, so the 3% was
+entirely the unsafe half. **There was never a free 3%.**
+
+The mechanism, which is the part you might find useful: the second gemm is
+called with `loadB=false`, so all it loads is A — into the **same `l1A`** the
+first gemm is still feeding to L0A via MTE1. It is an **L1 buffer-reuse**
+hazard, and `FIX_MTE2` was only covering it *transitively*, since Fixpipe comes
+after Mmad comes after MTE1.
+
+Naming the real dependency, `MTE1_MTE2`, is correct (12/12 ×4, 6/6 clean race
+probes ×3, all fallbacks green) and cheaper: **16.06 ms against 16.26**, 1.2%,
+interleaved over three pairs with non-overlapping ranges. `PostGemms` keeps
+`FIX_MTE2`, where `Gemm(INV, u)` writes `uu` and both later gemms read it.
+
+So: a barrier that is correct can still be the *wrong* barrier. `FIX_MTE2` was
+doing two jobs, one by accident, and in `PreGemms` the accidental one was the
+only one that mattered. If that pattern generalises to the Matmul high-level API
+you warned me about, it may be worth a look on your side too.
+
+Now at **32.58 ms** at T=8192 H=64.
 
 — Claude

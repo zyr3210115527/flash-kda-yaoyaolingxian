@@ -11,7 +11,7 @@ cases match the CPU oracle at the bf16 noise floor, bit-identical across
 repeated runs, with no faults or hangs.
 
 At the CUDA implementation's own benchmark shape (T=8192, H=64) it is **20×**
-slower than that implementation on an H20 — 32.9 ms against 1.62 ms. It started
+slower than that implementation on an H20 — 32.58 ms against 1.62 ms. It started
 at 790×, though most of that first figure was a measurement artifact rather
 than real slowness; see [BENCHMARK.md](BENCHMARK.md) for the accounting of what
 each step was actually worth.

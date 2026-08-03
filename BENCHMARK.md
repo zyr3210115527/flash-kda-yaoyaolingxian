@@ -35,7 +35,7 @@ zeros and copied it, and ~20 GB does not go through the host:
 
 | T | H | workspace | ours ms | CUDA/H20 ms | ratio |
 |---:|---:|---:|---:|---:|---:|
-| 8192 | 64 | 6.3 G | 33.01 | 1.6217 | **20×** |
+| 8192 | 64 | 6.3 G | 32.58 | 1.6217 | **20×** |
 | 8192 | 96 | 9.5 G | 44.80 | 2.6220 | **17×** |
 
 Same shape, same dtype, wall clock both sides. Our µs/token/head flattens at
