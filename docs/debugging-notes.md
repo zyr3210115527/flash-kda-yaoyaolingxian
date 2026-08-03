@@ -450,3 +450,51 @@ is ordered by this barrier.
 Both reverted. The 3% is real and available if the actual hazard is identified,
 but not worth taking blind — and the error degrading *everywhere* while only
 one shape fails is exactly the pattern that would pass a less thorough sweep.
+
+## The FIX_MTE2 in PreGemms was covering the wrong hazard (and the 3% was a race)
+
+Follow-up to the entry above, which left "3% is available if the real hazard is
+found" open. It is not — but 1.2% is, and the reasoning that got there corrects
+two things I had written down.
+
+Bisecting the two `PreGemms` gemms separately, four runs of the shape sweep and
+three race probes each:
+
+| barrier skipped | shape sweep | race probe |
+|---|---|---|
+| none (baseline) | 12 12 12 12 | 6 6 6 |
+| first gemm only | 12 12 12 12 | 6 6 6 |
+| **second gemm only** | **11 12 11 12 11** | **0 0 0** |
+| both | 11 12 11 12 12 | 0 0 0 |
+
+So the whole hazard is in the **second** gemm, and it is a **race** — not the
+deterministic dependency the earlier 11/12 looked like. That also explains the
+signature that puzzled me: every case's error degrading slightly with one shape
+tipping over tolerance is exactly what a race looks like, and I had read it as a
+partially ordered read. A single sweep is not evidence here; the same config
+gave 11/12 and 12/12 on alternating runs.
+
+Skipping the first gemm's barrier alone is safe and worth **0.00 ms**, so the
+3% I measured earlier came entirely from removing the *unsafe* one. There was
+never a free 3%.
+
+**Why the second gemm and not the first.** It is called with `loadB=false` — it
+reuses the state already in L1 — so all it loads is A, into the *same* `l1A` the
+first gemm is still feeding to L0A via MTE1. That is an **L1 buffer-reuse
+hazard**, and `FIX_MTE2` was only covering it *transitively*: Fixpipe comes
+after Mmad comes after MTE1, so waiting on the Fixpipe happens to wait on the
+MTE1 too.
+
+Naming the real dependency instead — `MTE1_MTE2` — is correct (12/12 × 4, 6/6
+clean race probes × 3) and cheaper: **16.06 ms against 16.26**, 1.2%, measured
+interleaved across three pairs with non-overlapping ranges.
+
+Narrowing both `PreGemms` gemms measures the same as narrowing only the second
+(16.06 vs 16.06), and both are taken, because both have the same dependency and
+neither reads a prior Fixpipe's output. `PostGemms` keeps `FIX_MTE2`: there
+`Gemm(INV, u)` writes `uu` and both later gemms read it, so the Fixpipe really
+does have to land first.
+
+The general shape, worth remembering: **a barrier that is correct can still be
+the wrong barrier.** `FIX_MTE2` was doing two jobs here, one of them by
+accident, and the accidental one was the only one that mattered in `PreGemms`.

@@ -1214,11 +1214,12 @@ private:
         const int64_t state = Slot(params, tileIdx, headIdx, 3);
 
         // s4 = k_dec @ state, the delta-rule prediction to subtract from v.
-        Gemm(bufs, params, kdec, state, Slot(params, tileIdx, headIdx, 4), CHUNK, D, D, false);
+        Gemm(bufs, params, kdec, state, Slot(params, tileIdx, headIdx, 4), CHUNK, D, D, false,
+             /*loadB=*/true, /*prevGemmOutputIsMyInput=*/false);
         // s6 = q_dec @ state, the first half of out.
         // Same state as operand B, already in L1 from the call above.
         Gemm(bufs, params, qdec, state, Slot(params, tileIdx, headIdx, 6), CHUNK, D, D, false,
-             /*loadB=*/false);
+             /*loadB=*/false, /*prevGemmOutputIsMyInput=*/false);
         (void)seqIdx;
         (void)mqk;
         (void)inv;
@@ -1254,7 +1255,8 @@ private:
     // it is fetching operands rather than computing -- and the state is the
     // bulk of what it fetches.
     void Gemm(K2AicBufs& bufs, Params const& params, int64_t aByte, int64_t bByte, int64_t cByte,
-              int m, int n, int k, bool bf16Out, bool loadB = true)
+              int m, int n, int k, bool bf16Out, bool loadB = true,
+              bool prevGemmOutputIsMyInput = true)
     {
         AscendC::GlobalTensor<BF16> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ BF16*>(params.workspace));
@@ -1265,8 +1267,35 @@ private:
         auto l0B = bufs.template L0B<BF16>();
         auto l0C = bufs.template L0C<float>();
 
-        AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+        // Two different hazards live here, and for a long time one barrier was
+        // covering both -- one of them only by accident.
+        //
+        // Always: this gemm loads A into the same l1A the PREVIOUS gemm is
+        // still feeding to L0A via MTE1. That is an L1 buffer-reuse hazard, and
+        // MTE1_MTE2 is its name.
+        //
+        // Additionally, when this gemm reads GM that a previous gemm's Fixpipe
+        // wrote (PostGemms: Gemm(INV, u) writes uu, then Mqk@uu and
+        // GemmAt(kres, uu) both read it), that write must land first, which is
+        // FIX_MTE2 -- and which transitively covers the l1A case too, since
+        // Fixpipe comes after Mmad comes after MTE1.
+        //
+        // PreGemms has no such read: k_dec@state and q_dec@state write
+        // different slots and read neither, and their shared B operand is
+        // written by the AIV. Using FIX_MTE2 there was ordering against a write
+        // it did not care about. Naming the real dependency instead is worth
+        // 1.2% (16.26 -> 16.06 ms), measured interleaved over three pairs.
+        //
+        // Do not "simplify" this by dropping the barrier in PreGemms entirely.
+        // That is 3% and it is a race: 0/6 clean race probes, and a shape sweep
+        // that passes 12/12 about half the time. See docs/debugging-notes.md.
+        if (prevGemmOutputIsMyInput) {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>((event_t)0);
+        } else {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>((event_t)0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>((event_t)0);
+        }
 
         LoadNd2Nz(bufs, l1A, gm, aByte, m, k);   // A: RowMajor -> zN, feeds L0A
         if (loadB) {
