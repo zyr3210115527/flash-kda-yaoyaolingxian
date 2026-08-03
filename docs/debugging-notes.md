@@ -498,3 +498,30 @@ does have to land first.
 The general shape, worth remembering: **a barrier that is correct can still be
 the wrong barrier.** `FIX_MTE2` was doing two jobs here, one of them by
 accident, and the accidental one was the only one that mattered in `PreGemms`.
+
+### Where the narrowing pays, and where it does not
+
+Having found that `MTE1_MTE2` is the right barrier for a gemm whose inputs do
+not come from a preceding Fixpipe, the obvious next move is to apply it
+everywhere that holds. There is exactly one other such gemm: `PostGemms`' first,
+`Gemm(INV, u) -> uu`, which reads kernel1's `INV` and the AIV's `u`. (The two
+after it read `uu` and genuinely need `FIX_MTE2`.)
+
+Narrowed it. Correct — 12/12 four times, 6/6 clean race probes four times — and
+worth **0.00 ms**: 16.06 against 16.06.
+
+**Reverted**, because a barrier change that buys nothing is pure risk surface in
+a kernel that has already produced three races, and `FIX_MTE2` is the stronger
+of the two.
+
+But the null result explains the positive one, which makes it worth keeping in
+writing. A `FIX_MTE2` only *costs* anything when the previous Fixpipe is still
+in flight when the next gemm wants to load. That is true for `PreGemms`' two
+gemms, which run back to back on the cube with nothing between them. It is false
+for `PostGemms`' first gemm, which is separated from the preceding gemm by an
+entire AIV phase and two cross-core handshakes — by the time the cube gets
+control again, the Fixpipe drained long ago and the barrier is free.
+
+So the rule for where this optimisation is available: **back-to-back gemms on
+the same core, not gemms separated by a handoff.** That predicts there is
+nothing further to collect here, and it is the reason to stop looking.
