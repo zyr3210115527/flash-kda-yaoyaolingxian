@@ -26,6 +26,13 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+import torch_npu  # noqa: F401
+
+# Chunk size comes from the extension, not a local constant: a test that
+# hardcodes it silently stops matching the kernel when the kernel changes.
+from flash_kda import _C as _kda_C
+CHUNK = _kda_C.CHUNK
 D = 128
 
 
@@ -134,12 +141,6 @@ def cpu_selfcheck():
 
 
 def npu_check():
-    import torch_npu  # noqa: F401
-
-# Chunk size comes from the extension, not a local constant: a test that
-# hardcodes it silently stops matching the kernel when the kernel changes.
-from flash_kda import _C as _kda_C
-CHUNK = _kda_C.CHUNK
     from flash_kda import fwd, _C
 
     dev = torch.device("npu:0")

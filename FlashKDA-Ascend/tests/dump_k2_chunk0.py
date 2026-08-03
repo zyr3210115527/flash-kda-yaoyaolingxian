@@ -28,6 +28,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, 'tests'))
 
+import torch_npu  # noqa: F401
+
+# Chunk size comes from the extension, not a local constant: a test that
+# hardcodes it silently stops matching the kernel when the kernel changes.
+from flash_kda import _C as _kda_C
+CHUNK = _kda_C.CHUNK
+
 CHUNK, D = 16, 128
 # From the extension. These offsets have moved twice -- once when the workspace
 # shrank from 608 KB to 207 KB per tile, once when the narrow slots were
@@ -38,7 +45,9 @@ SCRATCH = _kda_C.WS_OFF_SCRATCH
 
 
 def slot(i):
-    return SCRATCH + i * SLOT
+    # Slots are neither uniformly sized (two [D,D] wide, seven [CHUNK,D] narrow)
+    # nor in index order, so base + i*stride is wrong. WS_SLOT_OFF is the map.
+    return _kda_C.WS_SLOT_OFF[i]
 
 
 def bf16(raw, off, n):
@@ -57,9 +66,6 @@ def rel(a, b):
 
 
 def main():
-    import torch_npu  # noqa
-
-from flash_kda import _C as _kda_C: F401
     from flash_kda import _C
 
     dev = torch.device("npu:0")

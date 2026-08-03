@@ -21,6 +21,13 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+import torch_npu  # noqa: F401
+
+# Chunk size comes from the extension, not a local constant: a test that
+# hardcodes it silently stops matching the kernel when the kernel changes.
+from flash_kda import _C as _kda_C
+CHUNK = _kda_C.CHUNK
 D = 128
 
 # WorkspaceOffsets from layout.hpp
@@ -51,12 +58,6 @@ def rel(a, b):
 
 
 def main():
-    import torch_npu  # noqa: F401
-
-# Chunk size comes from the extension, not a local constant: a test that
-# hardcodes it silently stops matching the kernel when the kernel changes.
-from flash_kda import _C as _kda_C
-CHUNK = _kda_C.CHUNK
     from flash_kda import _C
     from check_prepare import gate_and_decay
 

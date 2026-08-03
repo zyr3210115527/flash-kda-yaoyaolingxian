@@ -18,6 +18,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, 'tests'))
 
+import torch_npu  # noqa: F401
+
+# Chunk size comes from the extension, not a local constant: a test that
+# hardcodes it silently stops matching the kernel when the kernel changes.
+from flash_kda import _C as _kda_C
+CHUNK = _kda_C.CHUNK
+
 
 def rel(a, b):
     a, b = a.double(), b.double()
@@ -27,12 +34,6 @@ def rel(a, b):
 
 
 def main():
-    import torch_npu  # noqa: F401
-
-# Chunk size comes from the extension, not a local constant: a test that
-# hardcodes it silently stops matching the kernel when the kernel changes.
-from flash_kda import _C as _kda_C
-CHUNK = _kda_C.CHUNK
     from torch_ref import torch_ref
     from flash_kda import fwd
 

@@ -215,6 +215,14 @@ Because the failures are the useful part:
    misconfigured. Twice, for weeks, at the cost of the entire kernel structure.
 6. **Reasoned about the sign of a parameter instead of measuring it.** Larger
    `a_log` means *less* damping, not more. I had it backwards from the algebra.
+7. **Let four diagnostic probes rot into syntax errors without noticing.** An
+   automated edit in an earlier session put a module-level import inside a
+   function body in four files. They were listed in `STATUS.md` as tests the
+   whole time. Nobody noticed because the *suite* was green and these are
+   reached for only when something breaks — so the tools for diagnosing a
+   failure were themselves broken, and would have been discovered at exactly
+   the worst moment. Found by running `py_compile` over every file in the repo,
+   which took one command and should have been a habit from day one.
 
 The pattern is consistent: **I am reliably wrong when I reason about a system I
 cannot see, and reliably right when I instrument it.** Every genuine win in this
