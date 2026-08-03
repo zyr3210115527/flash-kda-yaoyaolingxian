@@ -93,7 +93,10 @@ fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 | `final_state` | `[N, H, D, D]` | bf16/fp32 | Optional output state buffer |
 | `cu_seqlens` | `[N+1]` | int64 | Optional cumulative sequence lengths |
 
-**Constraints**: D must be 128. All inputs must be NPU, contiguous. B=1 when cu_seqlens provided.
+**Constraints**: D must be 128. All inputs must be NPU, contiguous. B=1 when
+cu_seqlens provided. `CHUNK · |lower_bound| ≤ ~88`, because the in-chunk decay
+must stay in fp32 range — a model constraint the CUDA reference shares, not a
+kernel choice.
 
 ## FLA Integration
 
@@ -109,23 +112,35 @@ Opt out with `FLA_FLASH_KDA=0`. Debug with `logging.basicConfig(level=logging.IN
 ## Testing
 
 ```bash
-# Quick smoke test
-bash tests/test.sh
-
-# Full parametrized test suite
-bash tests/run_test_full.sh
-
-# Single test
-cd tests && pytest test_fwd_full.py -x -v -k "test_fwd_fixed"
+python tests/test_all_parse.py     # every file parses. No hardware, <1s. Run first.
+python tests/test_shapes.py        # 12 shape and feature cases vs the CPU oracle
+python tests/race_probe.py         # determinism. Run it 6+ times; once proves nothing.
+python tests/workspace_poison.py   # nothing reads the workspace before writing it
+python benchmarks/ab_compare.py    # interleaved A/B, resolves ~1%
+python benchmarks/profile_pipes.py # hardware pipe counters
 ```
+
+Correctness is against `tests/torch_ref.py`, a CPU emulator that reproduces the
+CUDA kernel's arithmetic bit for bit — its fp16 accumulation, its sigmoid
+approximation, its rounding order. The oracle is itself verified against an
+independently written float64 implementation by `tests/validate_ref.py`, which
+needs no hardware.
+
+Two habits this project learned the hard way: a single timed run means nothing
+(between-process spread is ±8%, within-process 0.4-0.9%, hence `ab_compare.py`),
+and a single clean race probe means nothing either — two intermittent races here
+hid behind one green run.
 
 ## Architecture
 
-Two-kernel pipeline, template-specialized on 5 boolean flags (`HasStateIn`, `HasStateOut`, `StateFP32`, `IsVarlen`), producing 14 variants.
+Two-kernel pipeline, template-specialized on the state and varlen flags. Both
+kernels are **single fused launches** that hand off between the cube and vector
+cores with `CrossCoreSetFlag`/`WaitFlag`, and both vector cores participate.
 
 ### Kernel 1: Prepare (AIV-dominant)
 
-Grid: `(total_tiles × H)`, 1 AIC+AIV core per (tile, head)
+Grid-strided over `(tile × head)`; each core walks its own unit sequence, and
+the two AIV subblocks split the rows of each phase.
 
 1. **AIV**: Load q, k, g, beta, dt_bias from GM → UB
 2. **AIV**: L2 normalize q and k (vector reduction)
@@ -139,17 +154,20 @@ Grid: `(total_tiles × H)`, 1 AIC+AIV core per (tile, head)
 
 ### Kernel 2: Recurrence (AIC-dominant)
 
-Grid: `(N × H)`, 1 AIC+AIV core per (sequence, head), 2-stage pingpong pipeline
+Grid: `(N × H)`, one unit per (sequence, head). The `[D,D]` recurrent state
+stays resident in UB across the whole chunk loop rather than round-tripping.
 
-1. **AIC**: Load initial state from GM → L1
-2. Per-chunk loop:
-   - **AIC**: Dual GEMM k_decayed@state, q_decayed@state
-   - **AIV**: v_sub = (v - k_decayed@state) * sigmoid(beta)
-   - **AIC**: u = INV @ v_sub, out = q_decayed@state + Mqk @ u
-   - **AIC**: State update GEMM k_restored^T @ u
-   - **AIV**: state = state * exp(g_total) + k_restored^T @ u
-   - **AIV**: Store output to GM
-3. **AIC**: Store final state to GM
+1. **AIV**: InitState, and `PreGemms` for the first chunk is peeled onto the AIC
+2. Per-chunk loop, 2 cross-core round trips:
+   - **AIV**: v_sub = (v - k_decayed@state) * sigmoid(beta), u = INV @ v_sub
+   - **AIC**: `PostGemms(c)` — Mqk@u, k_restored^T@u — then `PreGemms(c+1)`
+   - **AIV**: StoreOut ∥ DecayState, split 8/20 rows between the subblocks
+3. **AIV**: Store final state to GM
+
+The AIC/AIV alternation here is a **true data dependency**, not a handshake
+artifact: `FinishOut(c+1)` reads `PreGemms(c+1)`'s output, so the vector core
+cannot start chunk c+1 before the cube finishes it. Halving the handshakes
+(4 round trips → 2) is correct and measures identically.
 
 ### Memory Hierarchy
 
@@ -168,7 +186,7 @@ GM ──Nd2Nz──→ L1 (512KB) ──LoadData──→ L0A/L0B (64KB) ──
 | PipeBarrier (warp sync) | CrossCoreSetFlag/WaitFlag (AIC↔AIV) |
 | SM75_U32x1_MOVM_T (register transpose) | LoadData2DParams.ifTranspose |
 | GMMA swizzled workspace | RowMajor workspace + Nd2Nz on load |
-| 4 MMA warps (192 threads) | 1 AIC core + 1 AIV core |
+| 4 MMA warps (192 threads) | 1 AIC core + **2** AIV subblocks (A2 is 1:2) |
 
 ## Environment Variables
 
@@ -177,6 +195,13 @@ GM ──Nd2Nz──→ L1 (512KB) ──LoadData──→ L0A/L0B (64KB) ──
 | `ASCEND_HOME_PATH` | CANN SDK path | Required |
 | `FLASH_KDA_ASCEND_ARCH` | Target architecture | `2201` |
 | `FLA_FLASH_KDA` | Set `0` to opt out of FLA dispatch | `1` |
+| `FLASH_KDA_FUSED_K1`, `FLASH_KDA_FUSED_K2` | `0` falls back to per-phase launches | `1` |
+| `FLASH_KDA_L1_NEUMANN` | `0` routes the Neumann chain through GM | `1` |
+| `FLASH_KDA_FAST_NORM` | `0` reduces one row at a time | `1` |
+| `FLASH_KDA_SKIP_K2` | kernel1 only, for profiling and workspace probes | `0` |
+
+Each optimisation keeps its predecessor reachable, because that predecessor is
+what it was validated against. All four fallbacks pass 12/12.
 
 ## License
 

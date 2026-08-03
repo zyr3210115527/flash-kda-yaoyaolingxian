@@ -52,6 +52,7 @@ cd .. && PYTHONPATH=$PWD:$PWD/tests python3 tests/test_shapes.py
 
 | Test | What it covers |
 |---|---|
+| `tests/test_all_parse.py` | that every test and benchmark parses. No hardware, under a second. Four probes sat broken for days because the suite was green and nobody ran them. |
 | `tests/test_shapes.py` | the 12 shape and feature cases |
 | `tests/race_probe.py` | determinism — bitwise diff over repeats. Run it 6+ times. |
 | `tests/race_fields.py` | which workspace field first goes non-deterministic |
