@@ -26,7 +26,9 @@ def main():
         if not os.path.isdir(d):
             continue
         for name in sorted(os.listdir(d)):
-            if not name.endswith('.py'):
+            # Skip macOS AppleDouble resource forks ("._foo.py"): they are
+            # binary metadata that tar can carry onto a build host, not source.
+            if not name.endswith('.py') or name.startswith('._'):
                 continue
             path = os.path.join(d, name)
             checked += 1

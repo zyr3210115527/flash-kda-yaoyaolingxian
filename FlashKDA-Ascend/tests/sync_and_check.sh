@@ -15,7 +15,9 @@ REMOTE=/user/zhouyiran/flashkda/FlashKDA-Ascend
 
 echo "=== packing local sources ==="
 cd "$LOCAL" || exit 1
-tar czf /tmp/sync.tgz include src tests flash_kda CMakeLists.txt || exit 1
+# COPYFILE_DISABLE stops macOS tar emitting AppleDouble "._foo.py" resource
+# forks, which land on the device as null-byte files that look like source.
+COPYFILE_DISABLE=1 tar czf /tmp/sync.tgz include src tests flash_kda CMakeLists.txt || exit 1
 ls -la /tmp/sync.tgz
 
 echo "=== uploading ==="
